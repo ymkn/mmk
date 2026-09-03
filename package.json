@@ -1,0 +1,12 @@
+{
+  "name": "hondana-kindle-library-manager",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "discover:kindle": "node --experimental-sqlite tools/kindle-discovery.mjs --pretty",
+    "test": "node --experimental-sqlite --test"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
