@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-show-amazon-login"
+description = "Enables the show_amazon_login command without any pre-configured scope."
+commands.allow = ["show_amazon_login"]
+
+[[permission]]
+identifier = "deny-show-amazon-login"
+description = "Denies the show_amazon_login command without any pre-configured scope."
+commands.deny = ["show_amazon_login"]

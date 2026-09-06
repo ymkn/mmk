@@ -1,10 +1,25 @@
 {
-  "name": "hondana-kindle-library-manager",
+  "name": "mmk",
   "private": true,
   "type": "module",
   "scripts": {
-    "discover:kindle": "node --experimental-sqlite tools/kindle-discovery.mjs --pretty",
-    "test": "node --experimental-sqlite --test"
+    "dev": "vite --port 1420",
+    "build": "tsc --noEmit && vite build",
+    "build:exe": "tauri build --no-bundle",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
   },
   "engines": {
     "node": ">=22.5.0"

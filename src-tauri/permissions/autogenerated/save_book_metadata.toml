@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-book-metadata"
+description = "Enables the save_book_metadata command without any pre-configured scope."
+commands.allow = ["save_book_metadata"]
+
+[[permission]]
+identifier = "deny-save-book-metadata"
+description = "Denies the save_book_metadata command without any pre-configured scope."
+commands.deny = ["save_book_metadata"]

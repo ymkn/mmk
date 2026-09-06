@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-series-metadata"
+description = "Enables the update_series_metadata command without any pre-configured scope."
+commands.allow = ["update_series_metadata"]
+
+[[permission]]
+identifier = "deny-update-series-metadata"
+description = "Denies the update_series_metadata command without any pre-configured scope."
+commands.deny = ["update_series_metadata"]

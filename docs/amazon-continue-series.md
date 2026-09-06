@@ -1,0 +1,37 @@
+# Amazon 新刊チェック
+
+## 情報源
+
+情報源はAmazonの「読み始めたシリーズの続きを読むにはこちら」ページである。現時点では、次のURLを基礎にする。
+
+```text
+https://www.amazon.co.jp/amz-books/seeMore/?widgetId=desktop-books-storefront_ContinueSeriesDRS_V2&title=読み始めたシリーズの続きを読むにはこちら&sourceType=RECS&page=1&filters=v1:FORMAT[kindle_edition]&metadata=...&cardFeedType=widgetId&ccs_id=<generated-uuid>
+```
+
+URLに含まれる `pd_rd_*`、`pf_rd_*`、`ref_` は表示時の推薦リクエストやセッションに依存するため固定しない。`metadata` は端末種別を表す固定値としてURLに含める。`ccs_id` はこのページで推薦カードを返すために必要であり、開くたびに生成し、CookieやDBへ保存しない。`page` はページング用、`filters` はKindle版への絞り込み用である。
+
+## 取得方法
+
+「新刊チェック」を押すと、ローカルアプリデータ配下の `amazon-webview` をデータ領域とする専用WebViewを非表示で開く。ログアウト状態なら、目的ページにあるAmazon公式ログインリンクへ非表示のまま遷移し、ログイン画面の読み込み後だけ前面へ表示する。ログイン完了後はリンクの `openid.return_to` により目的ページへ戻り、候補を取得して専用WebViewを閉じる。ログイン済みなら、画面を表示せずに取得して閉じる。初期化スクリプトがAmazonページ内の `CBBE_BooksCardsReactAssets_cardsToRender` の `asinList` を読み取り、ASIN・タイトル・価格・書影URLだけをRust側へ渡す。書影URLはAmazonの画像配信ホストに属するHTTPS URLだけを保存し、カードに含まれない場合はASINからAmazon公式の書影URLを組み立てる。
+
+Cookie、`ajaxContext`、`ccs_id`、ページHTML全体はアプリのDBへ渡さない。AmazonへのログインやCookieの管理はWebViewに任せる。取得結果は中央ペインの「新刊チェック」タブだけに表示し、通常のライブラリ一覧には混在させない。候補のシリーズ名を押すと、フィルターを解除して「ライブラリ」タブへ移り、手元の同シリーズの巻一覧を表示する。
+
+## 表示判定
+
+Amazonカードのタイトルに対して、既存のシリーズ推定処理を使う。次の条件をすべて満たす候補だけを中央ペインへ表示する。
+
+1. ASINが手元のアクティブなKindleライブラリに存在しない。
+2. 推定したシリーズ名が、手元の書籍の有効シリーズ名と一致する。
+3. 推定巻数が、手元の同シリーズの最大巻数より大きい。
+4. シリーズ名と巻数を安全に推定できる。
+5. Amazonカードから価格を取得できる。
+
+この判定は「未購入」をAmazonの購入情報で検証するものではない。Amazonページにはその情報が見当たらないため、Amazonの推薦と手元の所蔵状況を組み合わせた「続刊候補」である。無料配布やKindle Unlimitedで取得した序盤巻がライブラリに存在する場合も、手元の最大巻数に含めることで、後続部分を優先して表示する。価格不明の商品は予約受付前とみなし、価格が取得できるようになるまで表示しない。
+
+## 制限
+
+- AmazonページのHTML構造や埋め込みデータ名が変更されると取得できない。
+- タイトルからシリーズ名・巻数を推定できない作品は表示しない。
+- Amazonの推薦に出ない作品や、ページ1に含まれない作品は対象外である。
+- 手元のKindleキャッシュにない購入済み巻を完全には判別できない。
+- 「Amazon連携を解除」は専用WebViewの閲覧データと保存済み候補を削除する。ChromeのCookieやAmazon本体のアカウント状態には触れない。

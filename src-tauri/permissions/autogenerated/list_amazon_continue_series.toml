@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-amazon-continue-series"
+description = "Enables the list_amazon_continue_series command without any pre-configured scope."
+commands.allow = ["list_amazon_continue_series"]
+
+[[permission]]
+identifier = "deny-list-amazon-continue-series"
+description = "Denies the list_amazon_continue_series command without any pre-configured scope."
+commands.deny = ["list_amazon_continue_series"]

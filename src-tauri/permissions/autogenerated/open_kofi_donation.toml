@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-kofi-donation"
+description = "Enables the open_kofi_donation command without any pre-configured scope."
+commands.allow = ["open_kofi_donation"]
+
+[[permission]]
+identifier = "deny-open-kofi-donation"
+description = "Denies the open_kofi_donation command without any pre-configured scope."
+commands.deny = ["open_kofi_donation"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-amazon-product-page"
+description = "Enables the open_amazon_product_page command without any pre-configured scope."
+commands.allow = ["open_amazon_product_page"]
+
+[[permission]]
+identifier = "deny-open-amazon-product-page"
+description = "Denies the open_amazon_product_page command without any pre-configured scope."
+commands.deny = ["open_amazon_product_page"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-in-kindle"
+description = "Enables the open_in_kindle command without any pre-configured scope."
+commands.allow = ["open_in_kindle"]
+
+[[permission]]
+identifier = "deny-open-in-kindle"
+description = "Denies the open_in_kindle command without any pre-configured scope."
+commands.deny = ["open_in_kindle"]

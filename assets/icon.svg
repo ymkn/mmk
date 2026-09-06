@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Manga Manager for Kindle">
+  <rect width="512" height="512" rx="104" fill="#765a35"/>
+  <rect x="104" y="92" width="304" height="328" rx="24" fill="#f5f2ec"/>
+  <path d="M256 120v270" stroke="#bda989" stroke-width="12"/>
+  <path d="M128 134c45-17 86-11 128 18v238c-40-27-82-34-128-17z" fill="#fffdf9" stroke="#d6cbbc" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M384 134c-45-17-86-11-128 18v238c40-27 82-34 128-17z" fill="#fffdf9" stroke="#d6cbbc" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M162 194h62M162 234h62M288 194h62M288 234h62" stroke="#765a35" stroke-width="12" stroke-linecap="round"/>
+  <path d="M162 294h62M288 294h62" stroke="#b08b58" stroke-width="12" stroke-linecap="round"/>
+</svg>
