@@ -53,6 +53,14 @@ impl Database {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        if !table_has_column(&connection, "amazon_continue_series_items", "has_rating")? {
+            connection
+                .execute(
+                    "ALTER TABLE amazon_continue_series_items ADD COLUMN has_rating INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         Ok(database)
     }
 
@@ -346,8 +354,8 @@ impl Database {
 
             transaction
                 .execute(
-                    "INSERT INTO amazon_continue_series_items (asin, title, product_url, price, image_url, series_name, series_index, seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    rusqlite::params![asin, title, product_url, price, image_url, series_name, series_index, now],
+                    "INSERT INTO amazon_continue_series_items (asin, title, product_url, price, has_rating, image_url, series_name, series_index, seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    rusqlite::params![asin, title, product_url, price, item.has_rating, image_url, series_name, series_index, now],
                 )
                 .map_err(|error| error.to_string())?;
             stored += 1;
@@ -361,7 +369,7 @@ impl Database {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT asin, title, product_url, price, image_url, series_name, series_index, seen_at FROM amazon_continue_series_items WHERE price IS NOT NULL ORDER BY COALESCE(series_name, title) COLLATE NOCASE, series_index, title COLLATE NOCASE, asin",
+                "SELECT asin, title, product_url, price, has_rating, image_url, series_name, series_index, seen_at FROM amazon_continue_series_items WHERE price IS NOT NULL ORDER BY COALESCE(series_name, title) COLLATE NOCASE, series_index, title COLLATE NOCASE, asin",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -371,10 +379,11 @@ impl Database {
                     title: row.get(1)?,
                     product_url: row.get(2)?,
                     price: row.get(3)?,
-                    image_url: row.get(4)?,
-                    series_name: row.get(5)?,
-                    volume_index: row.get(6)?,
-                    seen_at: row.get(7)?,
+                    has_rating: row.get::<_, i64>(4)? != 0,
+                    image_url: row.get(5)?,
+                    series_name: row.get(6)?,
+                    volume_index: row.get(7)?,
+                    seen_at: row.get(8)?,
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -548,6 +557,7 @@ CREATE TABLE IF NOT EXISTS amazon_continue_series_items (
   title TEXT NOT NULL,
   product_url TEXT NOT NULL,
   price INTEGER,
+  has_rating INTEGER NOT NULL DEFAULT 0,
   image_url TEXT,
   series_name TEXT,
   series_index REAL,
@@ -830,24 +840,28 @@ mod tests {
                     asin: "b012345679".to_owned(),
                     title: "星巡り 第3巻".to_owned(),
                     price: Some(480),
+                    has_rating: true,
                     image_url: None,
                 },
                 AmazonContinueSeriesItemInput {
                     asin: "b012345679".to_owned(),
                     title: "重複した候補 3巻".to_owned(),
                     price: Some(500),
+                    has_rating: false,
                     image_url: Some("https://example.com/untrusted.jpg".to_owned()),
                 },
                 AmazonContinueSeriesItemInput {
                     asin: "not-an-asin".to_owned(),
                     title: "不正な候補".to_owned(),
                     price: None,
+                    has_rating: false,
                     image_url: None,
                 },
                 AmazonContinueSeriesItemInput {
                     asin: "b012345680".to_owned(),
                     title: "星巡り 第4巻".to_owned(),
                     price: None,
+                    has_rating: false,
                     image_url: None,
                 },
             ])
@@ -863,6 +877,7 @@ mod tests {
         );
         assert_eq!(items[0].series_name.as_deref(), Some("星巡り"));
         assert_eq!(items[0].volume_index, Some(3.0));
+        assert!(items[0].has_rating);
         assert_eq!(
             items[0].image_url.as_deref(),
             Some("https://images-na.ssl-images-amazon.com/images/P/B012345679.01.LZZZZZZZ.jpg")

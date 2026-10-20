@@ -44,6 +44,7 @@ export interface AmazonContinueSeriesItem {
   title: string;
   productUrl: string;
   price: number | null;
+  hasRating: boolean;
   imageUrl: string | null;
   seriesName: string | null;
   volumeIndex: number | null;

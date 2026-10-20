@@ -82,6 +82,28 @@ pub const AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT: &str = r#"
     return parsePrice(value.altText || value.displayString || '');
   };
 
+  const ratingKeys = new Set(['rating', 'ratingValue', 'starRating', 'reviewRating', 'averageRating', 'customerRating']);
+  const containsRatingValue = (value, depth = 0) => {
+    if (depth > 3 || value == null) return false;
+    if (typeof value === 'number') return Number.isFinite(value);
+    if (typeof value === 'string') return value.trim() !== '';
+    if (typeof value !== 'object') return false;
+    return Object.values(value).some((child) => containsRatingValue(child, depth + 1));
+  };
+
+  const cardHasRating = (card) => {
+    const visit = (value, key, depth) => {
+      if (depth > 5 || value == null) return false;
+      if (ratingKeys.has(key) && containsRatingValue(value)) return true;
+      if (typeof value !== 'object') return false;
+      return Object.entries(value).some(([childKey, child]) => visit(child, childKey, depth + 1));
+    };
+    if (visit(card, '', 0)) return true;
+
+    const cardElement = Array.from(document.querySelectorAll('[data-asin]')).find((element) => element.getAttribute('data-asin') === String(card.asin));
+    return Boolean(cardElement?.querySelector('.a-icon-star, .a-icon-star-small, [aria-label*="星"], [aria-label*="star" i]'));
+  };
+
   const parseImageUrl = (card) => {
     const normalize = (value) => {
       if (typeof value !== 'string') return null;
@@ -155,6 +177,7 @@ pub const AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT: &str = r#"
           asin: String(card.asin || ''),
           title: String(card.bookTitle || ''),
           price: parsePrice(card.price),
+          hasRating: cardHasRating(card),
           imageUrl: parseImageUrl(card),
         })).filter((item) => item.asin && item.title);
         return send(items);

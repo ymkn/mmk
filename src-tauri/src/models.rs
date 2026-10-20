@@ -90,6 +90,7 @@ pub struct AmazonContinueSeriesItemInput {
     pub asin: String,
     pub title: String,
     pub price: Option<i64>,
+    pub has_rating: bool,
     pub image_url: Option<String>,
 }
 
@@ -100,6 +101,7 @@ pub struct AmazonContinueSeriesItemView {
     pub title: String,
     pub product_url: String,
     pub price: Option<i64>,
+    pub has_rating: bool,
     pub image_url: Option<String>,
     pub series_name: Option<String>,
     pub volume_index: Option<f64>,

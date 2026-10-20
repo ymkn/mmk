@@ -19,6 +19,7 @@ const UI_STATE_STORAGE_KEY = "mmk.ui-state.v1";
 const KINDLE_READER_MODE_STORAGE_KEY = "mmk.kindle-reader-mode.v1";
 const KINDLE_PROFILE_PATH_STORAGE_KEY = "mmk.kindle-profile-path.v1";
 const KOFI_LINK_VISIBLE_STORAGE_KEY = "mmk.kofi-link-visible.v1";
+const EXCLUDE_PRE_RELEASE_NEW_RELEASES_STORAGE_KEY = "mmk.exclude-pre-release-new-releases.v1";
 
 function readKindleReaderMode(): KindleReaderMode {
   try {
@@ -66,6 +67,23 @@ function writeKofiLinkVisible(visible: boolean): void {
   try {
     if (visible) localStorage.removeItem(KOFI_LINK_VISIBLE_STORAGE_KEY);
     else localStorage.setItem(KOFI_LINK_VISIBLE_STORAGE_KEY, "false");
+  } catch {
+    // 保存失敗は無視する。
+  }
+}
+
+function readExcludePreReleaseNewReleases(): boolean {
+  try {
+    return localStorage.getItem(EXCLUDE_PRE_RELEASE_NEW_RELEASES_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function writeExcludePreReleaseNewReleases(exclude: boolean): void {
+  try {
+    if (exclude) localStorage.removeItem(EXCLUDE_PRE_RELEASE_NEW_RELEASES_STORAGE_KEY);
+    else localStorage.setItem(EXCLUDE_PRE_RELEASE_NEW_RELEASES_STORAGE_KEY, "false");
   } catch {
     // 保存失敗は無視する。
   }
@@ -221,6 +239,7 @@ function App() {
   const [kindleReaderMode, setKindleReaderMode] = useState<KindleReaderMode>(() => readKindleReaderMode());
   const [kindleProfilePath, setKindleProfilePath] = useState(() => readKindleProfilePath());
   const [kofiLinkVisible, setKofiLinkVisible] = useState(() => readKofiLinkVisible());
+  const [excludePreReleaseNewReleases, setExcludePreReleaseNewReleases] = useState(() => readExcludePreReleaseNewReleases());
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("Kindle ライブラリを同期してください");
   const [uiHydrated, setUiHydrated] = useState(false);
@@ -312,6 +331,10 @@ function App() {
     writeKofiLinkVisible(kofiLinkVisible);
   }, [kofiLinkVisible]);
 
+  useEffect(() => {
+    writeExcludePreReleaseNewReleases(excludePreReleaseNewReleases);
+  }, [excludePreReleaseNewReleases]);
+
   const tagCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const book of books) for (const tag of book.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
@@ -361,6 +384,7 @@ function App() {
     const candidates = new Map<string, NewReleaseSeries>();
 
     for (const item of amazonItems) {
+      if (excludePreReleaseNewReleases && !item.hasRating) continue;
       if (ownedAsins.has(item.asin) || !item.seriesName || item.volumeIndex == null || !Number.isFinite(item.volumeIndex)) continue;
       const key = seriesKey(item.seriesName);
       const matchingBooks = owned.filter((book) => book.effectiveSeriesName && seriesKey(book.effectiveSeriesName) === key && book.effectiveSeriesIndex != null && Number.isFinite(book.effectiveSeriesIndex));
@@ -374,7 +398,7 @@ function App() {
     }
 
     return [...candidates.values()].sort((left, right) => left.name.localeCompare(right.name, "ja"));
-  }, [amazonItems, books]);
+  }, [amazonItems, books, excludePreReleaseNewReleases]);
   const openedSeriesName = openedSeries
     ? books.find((book) => book.effectiveSeriesName && seriesKey(book.effectiveSeriesName) === openedSeries)?.effectiveSeriesName ?? "シリーズ"
     : null;
@@ -535,7 +559,7 @@ function App() {
       </section>
 
       {settingsOpen
-        ? <SettingsPanel mode={kindleReaderMode} onChange={setKindleReaderMode} profilePath={kindleProfilePath} onProfilePathChange={setKindleProfilePath} kofiLinkVisible={kofiLinkVisible} onKofiLinkVisibleChange={setKofiLinkVisible} onClose={() => setSettingsOpen(false)} />
+        ? <SettingsPanel mode={kindleReaderMode} onChange={setKindleReaderMode} profilePath={kindleProfilePath} onProfilePathChange={setKindleProfilePath} kofiLinkVisible={kofiLinkVisible} onKofiLinkVisibleChange={setKofiLinkVisible} excludePreReleaseNewReleases={excludePreReleaseNewReleases} onExcludePreReleaseNewReleasesChange={setExcludePreReleaseNewReleases} onClose={() => setSettingsOpen(false)} />
         : showRightPanel && openedSeries && !selected
         ? <SeriesMetadataPanel
             name={openedSeriesName ?? "シリーズ"}
@@ -612,13 +636,15 @@ function SeriesMetadataPanel({ name, books, onClose, onUpdated }: {
   </aside>;
 }
 
-function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, kofiLinkVisible, onKofiLinkVisibleChange, onClose }: {
+function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, kofiLinkVisible, onKofiLinkVisibleChange, excludePreReleaseNewReleases, onExcludePreReleaseNewReleasesChange, onClose }: {
   mode: KindleReaderMode;
   onChange: (mode: KindleReaderMode) => void;
   profilePath: string;
   onProfilePathChange: (profilePath: string) => void;
   kofiLinkVisible: boolean;
   onKofiLinkVisibleChange: (visible: boolean) => void;
+  excludePreReleaseNewReleases: boolean;
+  onExcludePreReleaseNewReleasesChange: (exclude: boolean) => void;
   onClose: () => void;
 }) {
   return <aside className="panel settings-panel">
@@ -648,6 +674,8 @@ function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, kofiL
       <h3>表示</h3>
       <label className="settings-check-label"><input type="checkbox" checked={kofiLinkVisible} onChange={(event) => onKofiLinkVisibleChange(event.target.checked)} />「コーヒーをおごる」リンクを表示</label>
       <p className="hint">ツールバーの Ko-Fi 寄付リンクの表示を切り替えます。</p>
+      <label className="settings-check-label"><input type="checkbox" checked={excludePreReleaseNewReleases} onChange={(event) => onExcludePreReleaseNewReleasesChange(event.target.checked)} />発売前の新刊を除外</label>
+      <p className="hint">評価が表示されていない予約商品とみられる新刊候補を表示しません。判定はAmazonカードの評価表示に基づきます。</p>
     </section>
   </aside>;
 }
