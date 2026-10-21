@@ -7,6 +7,8 @@ fn main() {
             "adjust_score",
             "set_favorite",
             "update_series_metadata",
+            "list_series_preferences",
+            "update_series_preferences",
             "open_in_kindle",
             "open_amazon_product_page",
             "open_kindle_library",
@@ -16,6 +18,19 @@ fn main() {
             "show_amazon_login",
             "store_amazon_continue_series",
             "clear_amazon_session",
+            "list_capture_windows",
+            "open_capture_reader",
+            "clear_capture_reader_session",
+            "start_page_capture",
+            "start_batch_capture",
+            "page_capture_status",
+            "stop_page_capture",
+            "open_capture_directory",
+            "preview_capture_layout",
+            "choose_capture_root",
+            "get_backup_settings",
+            "save_backup_settings",
+            "list_pending_backups",
         ]));
     tauri_build::try_build(attributes).expect("failed to build Tauri application metadata");
 }

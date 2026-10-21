@@ -1,18 +1,20 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { api } from "./api";
-import { groupBooks, seriesKey } from "./domain";
-import type { AmazonContinueSeriesItem, Book, KindleOpenKind, KindleReaderMode, MetadataInput, SeriesMetadataInput, SeriesMode, SyncResult } from "./types";
+import { BackupDialog } from "./BackupDialog";
+import { BackupSettingsSection } from "./BackupSettings";
+import { readCaptureRoot, writeCaptureRoot } from "./captureSettings";
+import { booksInLibraryView, groupBooks, matchesRatingFilters, seriesKey, type ScoreFilter, type SeriesShelf } from "./domain";
+import { readFilterSections, writeFilterSections, type FilterSections } from "./filterSettings";
+import type { AmazonContinueSeriesItem, Book, KindleOpenKind, KindleReaderMode, MetadataInput, SeriesMetadataInput, SeriesMode, SeriesPreferences, SeriesPreferencesInput, SyncResult } from "./types";
 
-type ScoreFilter = "all" | "positive" | "negative";
 type LibraryView = "library" | "new-releases";
 
 interface UiStateSnapshot {
   version: 1;
   openedSeries: string | null;
   selectedBookId: number | null;
-  rightOpen: boolean;
 }
 
 const UI_STATE_STORAGE_KEY = "mmk.ui-state.v1";
@@ -103,7 +105,6 @@ function readUiState(): UiStateSnapshot | null {
       version: 1,
       openedSeries: typeof parsed.openedSeries === "string" ? parsed.openedSeries : null,
       selectedBookId: typeof parsed.selectedBookId === "number" ? parsed.selectedBookId : null,
-      rightOpen: typeof parsed.rightOpen === "boolean" ? parsed.rightOpen : true,
     };
   } catch {
     return null;
@@ -119,10 +120,10 @@ function writeUiState(snapshot: UiStateSnapshot): void {
 }
 
 function getActiveSeriesKeys(books: Book[]): Set<string> {
-  return new Set(groupBooks(books.filter((book) => book.sourceStatus === "active")).series.map((series) => series.key));
+  return new Set(books.filter((book) => book.sourceStatus === "active" && book.effectiveSeriesName).map((book) => seriesKey(book.effectiveSeriesName!)));
 }
 
-function resolveUiState(snapshot: UiStateSnapshot | null, books: Book[]): Pick<UiStateSnapshot, "openedSeries" | "selectedBookId" | "rightOpen"> {
+function resolveUiState(snapshot: UiStateSnapshot | null, books: Book[]): Pick<UiStateSnapshot, "openedSeries" | "selectedBookId"> {
   const activeBooks = books.filter((book) => book.sourceStatus === "active");
   const activeSeriesKeys = getActiveSeriesKeys(books);
   const selectedBook = snapshot?.selectedBookId == null ? null : activeBooks.find((book) => book.id === snapshot.selectedBookId) ?? null;
@@ -133,7 +134,6 @@ function resolveUiState(snapshot: UiStateSnapshot | null, books: Book[]): Pick<U
     return {
       openedSeries: seriesKeyName && activeSeriesKeys.has(seriesKeyName) ? seriesKeyName : null,
       selectedBookId: selectedBook.id,
-      rightOpen: true,
     };
   }
 
@@ -141,14 +141,12 @@ function resolveUiState(snapshot: UiStateSnapshot | null, books: Book[]): Pick<U
     return {
       openedSeries: storedSeries,
       selectedBookId: null,
-      rightOpen: true,
     };
   }
 
   return {
     openedSeries: null,
     selectedBookId: null,
-    rightOpen: snapshot?.rightOpen ?? true,
   };
 }
 
@@ -181,6 +179,22 @@ function FacetList({ items, selected, emptyText, onToggle }: {
   </div>;
 }
 
+function FilterSection({ id, title, open, count = 0, onToggle, children }: {
+  id: keyof FilterSections;
+  title: string;
+  open: boolean;
+  count?: number;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return <section className={`filter-section ${id === "tags" ? "tag-section" : ""}`}>
+    <h3><button className="filter-section-toggle" aria-expanded={open} aria-controls={`filter-${id}`} onClick={onToggle}>
+      <span aria-hidden="true">{open ? "▾" : "▸"}</span><span>{title}</span>{count > 0 && <small>{count}件選択</small>}
+    </button></h3>
+    <div id={`filter-${id}`} hidden={!open}>{children}</div>
+  </section>;
+}
+
 function coverUrl(book: Book): string | undefined {
   return book.coverPath ? convertFileSrc(book.coverPath) : undefined;
 }
@@ -209,6 +223,15 @@ function BookCard({ book, selected, onSelect, onOpenKindle }: { book: Book; sele
   );
 }
 
+function SeriesCard({ series, preferences, onSelect }: { series: SeriesShelf; preferences?: SeriesPreferences; onSelect: () => void }) {
+  const score = preferences?.score ?? 0;
+  return <button className="series-card" onClick={onSelect}>
+    <div className="series-cover"><BookCover book={series.coverBook} /><span className="book-stack" /></div>
+    <span className="book-title">{series.name}</span><span className="muted">{series.books.length}冊</span>
+    <span className="card-meta"><span>{preferences?.favorite ? "★" : "☆"}</span><span>シリーズ評価 {score > 0 ? `+${score}` : score}</span></span>
+  </button>;
+}
+
 interface NewReleaseSeries {
   key: string;
   name: string;
@@ -222,6 +245,7 @@ function formatPrice(price: number | null): string {
 
 function App() {
   const [books, setBooks] = useState<Book[]>([]);
+  const [seriesPreferences, setSeriesPreferences] = useState<SeriesPreferences[]>([]);
   const [amazonItems, setAmazonItems] = useState<AmazonContinueSeriesItem[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
@@ -233,9 +257,12 @@ function App() {
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
   const [openedSeries, setOpenedSeries] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<LibraryView>("library");
-  const [leftOpen, setLeftOpen] = useState(true);
-  const [rightOpen, setRightOpen] = useState(true);
+  const [filterSections, setFilterSections] = useState(() => readFilterSections());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [captureBook, setCaptureBook] = useState<Book | null>(null);
+  const [captureOpen, setCaptureOpen] = useState(false);
+  const [batchCaptureOpen, setBatchCaptureOpen] = useState(false);
+  const [captureRoot, setCaptureRoot] = useState(readCaptureRoot);
   const [kindleReaderMode, setKindleReaderMode] = useState<KindleReaderMode>(() => readKindleReaderMode());
   const [kindleProfilePath, setKindleProfilePath] = useState(() => readKindleProfilePath());
   const [kofiLinkVisible, setKofiLinkVisible] = useState(() => readKofiLinkVisible());
@@ -246,13 +273,18 @@ function App() {
   const initialUiStateRef = useRef<UiStateSnapshot | null>(null);
   const uiRestoreAppliedRef = useRef(false);
 
+  useEffect(() => { writeCaptureRoot(captureRoot); }, [captureRoot]);
+  useEffect(() => { writeFilterSections(filterSections); }, [filterSections]);
+
   const reload = async () => {
-    const [result, recommendations] = await Promise.all([
+    const [result, recommendations, preferences] = await Promise.all([
       api.listBooks(),
       api.listAmazonContinueSeries(),
+      api.listSeriesPreferences(),
     ]);
     setBooks(result);
     setAmazonItems(recommendations);
+    setSeriesPreferences(preferences);
     setUiHydrated(true);
     if (result.length) setStatus(`${result.length.toLocaleString()} 冊`);
     return result;
@@ -293,7 +325,6 @@ function App() {
     const next = resolveUiState(initialUiStateRef.current, books);
     setOpenedSeries(next.openedSeries);
     setSelectedId(next.selectedBookId);
-    setRightOpen(next.rightOpen);
     uiRestoreAppliedRef.current = true;
     setUiHydrated(true);
   }, [books, uiHydrated]);
@@ -316,8 +347,8 @@ function App() {
 
   useEffect(() => {
     if (!uiRestoreAppliedRef.current) return;
-    writeUiState({ version: 1, openedSeries, selectedBookId: selectedId, rightOpen });
-  }, [openedSeries, selectedId, rightOpen]);
+    writeUiState({ version: 1, openedSeries, selectedBookId: selectedId });
+  }, [openedSeries, selectedId]);
 
   useEffect(() => {
     writeKindleReaderMode(kindleReaderMode);
@@ -360,13 +391,17 @@ function App() {
     });
   };
 
+  const toggleFilterSection = (key: keyof FilterSections) => {
+    setFilterSections((current) => ({ ...current, [key]: !current[key] }));
+  };
+  const preferencesByKey = useMemo(() => new Map(seriesPreferences.map((item) => [item.key, item])), [seriesPreferences]);
+
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase("ja");
     return books.filter((book) => {
       if (book.sourceStatus !== "active") return false;
-      if (favoriteOnly && !book.favorite) return false;
-      if (scoreFilter === "positive" && book.score < 1) return false;
-      if (scoreFilter === "negative" && book.score > -1) return false;
+      const preferences = book.effectiveSeriesName ? preferencesByKey.get(seriesKey(book.effectiveSeriesName)) : undefined;
+      if (!matchesRatingFilters(book, preferences, favoriteOnly, scoreFilter)) return false;
       if (selectedAuthors.size > 0 && !book.authors.some((author) => selectedAuthors.has(author))) return false;
       if (selectedPublishers.size > 0 && (!book.publisher || !selectedPublishers.has(book.publisher))) return false;
       if (selectedLabels.size > 0 && (!book.label || !selectedLabels.has(book.label))) return false;
@@ -375,7 +410,7 @@ function App() {
       return [book.title, book.authors.join(" "), book.publisher ?? "", book.asin, book.effectiveSeriesName ?? "", book.tags.join(" ")]
         .join(" ").toLocaleLowerCase("ja").includes(needle);
     });
-  }, [books, favoriteOnly, query, scoreFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
+  }, [books, preferencesByKey, favoriteOnly, query, scoreFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
 
   const shelves = useMemo(() => groupBooks(filtered), [filtered]);
   const newReleaseSeries = useMemo<NewReleaseSeries[]>(() => {
@@ -405,11 +440,12 @@ function App() {
   const openedSeriesBooks = openedSeries
     ? books.filter((book) => book.sourceStatus === "active" && book.effectiveSeriesName && seriesKey(book.effectiveSeriesName) === openedSeries)
     : [];
+  const booksInView = useMemo(() => booksInLibraryView(filtered, openedSeries), [filtered, openedSeries]);
   const visibleBooks = openedSeries
-    ? filtered.filter((book) => book.effectiveSeriesName && seriesKey(book.effectiveSeriesName) === openedSeries).sort((a, b) => (a.effectiveSeriesIndex ?? Infinity) - (b.effectiveSeriesIndex ?? Infinity))
+    ? [...booksInView].sort((a, b) => (a.effectiveSeriesIndex ?? Infinity) - (b.effectiveSeriesIndex ?? Infinity))
     : shelves.singles;
   const selected = books.find((book) => book.id === selectedId) ?? null;
-  const showRightPanel = (activeView === "library" && rightOpen) || settingsOpen;
+  const openedSeriesPreferences = openedSeries ? preferencesByKey.get(openedSeries) : undefined;
 
   const openKindle = (book: Book) => {
     const kind = kindleReaderMode === "auto" ? inferKindleOpenKind(book) : kindleReaderMode;
@@ -465,6 +501,10 @@ function App() {
     await api.setFavorite(selected.id, value);
     patchBook(selected.id, { favorite: value });
   };
+  const updateSeriesPreferences = async (input: SeriesPreferencesInput) => {
+    const updated = await api.updateSeriesPreferences(input);
+    setSeriesPreferences((current) => [...current.filter((item) => item.key !== updated.key), updated]);
+  };
 
   const hasActiveFilters = query.trim() !== "" || favoriteOnly || scoreFilter !== "all" || selectedAuthors.size > 0 || selectedPublishers.size > 0 || selectedLabels.size > 0 || selectedTags.size > 0;
   const clearFilters = () => {
@@ -481,59 +521,61 @@ function App() {
     setActiveView("library");
     setOpenedSeries(key);
     setSelectedId(null);
-    setRightOpen(true);
   };
   const activeFilterChips = ([
     query.trim() && { key: "query", label: `検索: ${query.trim()}` },
     favoriteOnly && { key: "favorite", label: "★ お気に入り" },
     scoreFilter !== "all" && { key: "score", label: scoreFilter === "positive" ? "評価 ＋" : "評価 −" },
-    selectedAuthors.size > 0 && { key: "authors", label: `著者 ×${selectedAuthors.size}` },
-    selectedPublishers.size > 0 && { key: "publishers", label: `出版社 ×${selectedPublishers.size}` },
-    selectedLabels.size > 0 && { key: "labels", label: `レーベル ×${selectedLabels.size}` },
-    selectedTags.size > 0 && { key: "tags", label: `タグ ×${selectedTags.size}` },
+    selectedAuthors.size > 0 && { key: "authors", label: `著者: ${[...selectedAuthors].join("、")}` },
+    selectedPublishers.size > 0 && { key: "publishers", label: `出版社: ${[...selectedPublishers].join("、")}` },
+    selectedLabels.size > 0 && { key: "labels", label: `レーベル: ${[...selectedLabels].join("、")}` },
+    selectedTags.size > 0 && { key: "tags", label: `タグ: ${[...selectedTags].join("、")}` },
   ].filter(Boolean) as { key: string; label: string }[]);
 
   return (
-    <main className={`app-shell ${leftOpen ? "left-open" : ""} ${showRightPanel ? "right-open" : ""}`}>
-      {leftOpen && <aside className="panel filter-panel">
-        <header className="panel-header"><h2>フィルター</h2><button className="icon-button" onClick={() => setLeftOpen(false)} aria-label="フィルターペインを閉じる">×</button></header>
+    <main className="app-shell">
+      <aside className="panel filter-panel">
+        <header className="panel-header"><h2>フィルター</h2></header>
         {hasActiveFilters && <div className="active-filters" role="status">
           <div className="active-filter-chips">{activeFilterChips.map((chip) => <span key={chip.key} className="active-filter-chip" title={chip.label}>{chip.label}</span>)}</div>
           <button className="icon-button" onClick={clearFilters} aria-label="選択中のフィルターを解除">×</button>
         </div>}
         <input className="search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="タイトル、著者、タグ、ASIN" />
-        <button className={`filter-button ${favoriteOnly ? "active" : ""}`} onClick={() => setFavoriteOnly(!favoriteOnly)}>★ お気に入り</button>
-        <section><h3>評価</h3><div className="segmented">
+        <FilterSection id="tags" title="タグ" open={filterSections.tags} count={selectedTags.size} onToggle={() => toggleFilterSection("tags")}><div className="tag-cloud">
+          {tagCounts.length ? tagCounts.map(([tag, count]) => <button key={tag} className={selectedTags.has(tag) ? "tag active" : "tag"} aria-pressed={selectedTags.has(tag)} onClick={() => toggleFacet(setSelectedTags, tag)}>{tag}<small>{count}</small></button>) : <p className="muted">タグはまだありません</p>}
+        </div></FilterSection>
+        <FilterSection id="rating" title="お気に入り・評価" open={filterSections.rating} count={Number(favoriteOnly) + Number(scoreFilter !== "all")} onToggle={() => toggleFilterSection("rating")}>
+        <button className={`filter-button ${favoriteOnly ? "active" : ""}`} aria-pressed={favoriteOnly} onClick={() => setFavoriteOnly(!favoriteOnly)}>★ お気に入り</button>
+        <div className="segmented rating-filter">
           <button className={scoreFilter === "all" ? "active" : ""} onClick={() => setScoreFilter("all")}>すべて</button>
           <button className={scoreFilter === "positive" ? "active" : ""} onClick={() => setScoreFilter("positive")}>＋</button>
           <button className={scoreFilter === "negative" ? "active" : ""} onClick={() => setScoreFilter("negative")}>−</button>
-        </div></section>
-        <section><h3>著者</h3><FacetList items={authorCounts} selected={selectedAuthors} emptyText="著者情報はありません" onToggle={(value) => toggleFacet(setSelectedAuthors, value)} /></section>
-        <section><h3>出版社</h3><FacetList items={publisherCounts} selected={selectedPublishers} emptyText="出版社情報はありません" onToggle={(value) => toggleFacet(setSelectedPublishers, value)} /></section>
-        <section><h3>レーベル</h3><FacetList items={labelCounts} selected={selectedLabels} emptyText="レーベル情報はありません" onToggle={(value) => toggleFacet(setSelectedLabels, value)} /></section>
-        <section className="tag-section"><h3>タグ</h3><div className="tag-cloud">
-          {tagCounts.length ? tagCounts.map(([tag, count]) => <button key={tag} className={selectedTags.has(tag) ? "tag active" : "tag"} onClick={() => setSelectedTags((current) => { const next = new Set(current); next.has(tag) ? next.delete(tag) : next.add(tag); return next; })}>{tag}<small>{count}</small></button>) : <p className="muted">タグはまだありません</p>}
-        </div></section>
-      </aside>}
+        </div><p className="muted rating-filter-hint">書籍またはシリーズの登録が対象です。</p></FilterSection>
+        <FilterSection id="authors" title="著者" open={filterSections.authors} count={selectedAuthors.size} onToggle={() => toggleFilterSection("authors")}><FacetList items={authorCounts} selected={selectedAuthors} emptyText="著者情報はありません" onToggle={(value) => toggleFacet(setSelectedAuthors, value)} /></FilterSection>
+        <FilterSection id="publishers" title="出版社" open={filterSections.publishers} count={selectedPublishers.size} onToggle={() => toggleFilterSection("publishers")}><FacetList items={publisherCounts} selected={selectedPublishers} emptyText="出版社情報はありません" onToggle={(value) => toggleFacet(setSelectedPublishers, value)} /></FilterSection>
+        <FilterSection id="labels" title="レーベル" open={filterSections.labels} count={selectedLabels.size} onToggle={() => toggleFilterSection("labels")}><FacetList items={labelCounts} selected={selectedLabels} emptyText="レーベル情報はありません" onToggle={(value) => toggleFacet(setSelectedLabels, value)} /></FilterSection>
+      </aside>
 
       <section className="library-pane">
-        <header className="toolbar">
-          <div className="toolbar-left">
-            {!leftOpen && <button className="icon-button" onClick={() => setLeftOpen(true)} aria-label="フィルターペインを開く">☰</button>}
-            <div><h1>MMK</h1><p>{status}</p></div>
+        <header className="library-tab-bar">
+          <nav className="library-tabs" role="tablist" aria-label="中央ペインの表示">
+            <button id="library-tab" role="tab" aria-selected={activeView === "library"} aria-controls="library-panel" className={activeView === "library" ? "active" : ""} onClick={() => setActiveView("library")}>ライブラリ</button>
+            <button id="new-releases-tab" role="tab" aria-selected={activeView === "new-releases"} aria-controls="new-releases-panel" className={activeView === "new-releases" ? "active" : ""} onClick={openAmazonChecker}>新刊チェック<span className="tab-count">{newReleaseSeries.length}</span></button>
+          </nav>
+          <div className="library-actions" role="group" aria-label="ライブラリの操作">
+            <button className="primary" disabled={busy} onClick={sync}>{busy ? "同期中…" : "Kindleと同期"}</button>
+            <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="設定を開く">⚙</button>
+            {kofiLinkVisible && <button className="kofi-link" title="Ko-Fi でコーヒーをおごる" onClick={openKofi}>☕ コーヒーをおごる</button>}
           </div>
-          <div className="toolbar-actions"><button className="secondary toolbar-button" disabled={busy} onClick={openAmazonChecker}>新刊チェック</button><button className="primary" disabled={busy} onClick={sync}>{busy ? "同期中…" : "Kindleと同期"}</button><button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="設定を開く">⚙</button>{kofiLinkVisible && <button className="kofi-link" title="Ko-Fi でコーヒーをおごる" onClick={openKofi}>☕ コーヒーをおごる</button>}{activeView === "library" && !rightOpen && <button className="icon-button" onClick={() => setRightOpen(true)} aria-label="編集ペインを開く">✎</button>}</div>
         </header>
-        <nav className="library-tabs" role="tablist" aria-label="中央ペインの表示">
-          <button id="library-tab" role="tab" aria-selected={activeView === "library"} aria-controls="library-panel" className={activeView === "library" ? "active" : ""} onClick={() => setActiveView("library")}>ライブラリ</button>
-          <button id="new-releases-tab" role="tab" aria-selected={activeView === "new-releases"} aria-controls="new-releases-panel" className={activeView === "new-releases" ? "active" : ""} onClick={() => setActiveView("new-releases")}>新刊チェック<span className="tab-count">{newReleaseSeries.length}</span></button>
-        </nav>
-        {activeView === "library" && openedSeries && <div className="series-navigation">
-          <div className="series-navigation-main"><button className="back-button" onClick={() => { setOpenedSeries(null); setSelectedId(null); }}>← ライブラリ</button>
-            <div><span className="muted">シリーズ</span><h2>{openedSeriesName}</h2></div>
+        <div className="series-navigation">
+          <div className="series-navigation-main">{activeView === "library" && openedSeries && <button className="back-button" onClick={() => { setOpenedSeries(null); setSelectedId(null); }}>← ライブラリ</button>}
+            <div className="view-heading"><span className="muted">{activeView === "new-releases" ? "Amazonの続刊候補" : openedSeries ? "シリーズ" : hasActiveFilters ? "絞り込み結果" : "すべての書籍"}</span><h2>{activeView === "new-releases" ? "新刊チェック" : openedSeriesName ?? (hasActiveFilters ? activeFilterChips.map((chip) => chip.label).join(" / ") : "ライブラリ")}</h2>
+              {activeView === "library" && openedSeries && hasActiveFilters && <p className="view-filter-summary">{activeFilterChips.map((chip) => chip.label).join(" / ")}</p>}
+            </div>
           </div>
-          <button className="series-edit-button" onClick={() => { setSelectedId(null); setRightOpen(true); }}>シリーズを編集</button>
-        </div>}
+          {activeView === "library" && <button className="secondary toolbar-button" onClick={() => setBatchCaptureOpen(true)}>一括バックアップ…</button>}
+        </div>
         <div className="library-scroll">
           {activeView === "new-releases" ? <section id="new-releases-panel" role="tabpanel" aria-labelledby="new-releases-tab" className="new-release-section">
             <div className="section-heading"><h2 className="section-title">新刊チェック</h2><span className="muted">{newReleaseSeries.length}シリーズ</span></div>
@@ -549,37 +591,43 @@ function App() {
             <div className="new-release-footer"><span className="hint">Amazonの推薦と手元の巻数を照合した候補です。未購入の確定情報ではありません。</span><button className="library-link" onClick={clearAmazonSession}>Amazon連携を解除</button></div>
           </section> : <div id="library-panel" role="tabpanel" aria-labelledby="library-tab">
             {!openedSeries && shelves.series.length > 0 && <><h2 className="section-title">シリーズ</h2><div className="book-grid">
-              {shelves.series.map((series) => <button className="series-card" key={series.key} onClick={() => { setOpenedSeries(series.key); setSelectedId(null); setRightOpen(true); }}><div className="series-cover"><BookCover book={series.coverBook} /><span className="book-stack" /></div><span className="book-title">{series.name}</span><span className="muted">{series.books.length}冊</span></button>)}
+              {shelves.series.map((series) => <SeriesCard key={series.key} series={series} preferences={preferencesByKey.get(series.key)} onSelect={() => { setOpenedSeries(series.key); setSelectedId(null); }} />)}
             </div></>}
             <h2 className="section-title">{openedSeries ? "巻一覧" : "書籍"}</h2>
-            <div className="book-grid">{visibleBooks.map((book) => <BookCard key={book.id} book={book} selected={book.id === selectedId} onSelect={() => { setSelectedId(book.id); setRightOpen(true); }} onOpenKindle={openKindle} />)}</div>
+            <div className="book-grid">{visibleBooks.map((book) => <BookCard key={book.id} book={book} selected={book.id === selectedId} onSelect={() => setSelectedId(book.id)} onOpenKindle={openKindle} />)}</div>
             {!visibleBooks.length && (!shelves.series.length || openedSeries) && <div className="empty-state"><strong>表示する本がありません</strong><span>同期またはフィルター条件を確認してください。</span></div>}
           </div>}
         </div>
+        <footer className="library-status" role="status" title={status}>{status}</footer>
       </section>
 
       {settingsOpen
-        ? <SettingsPanel mode={kindleReaderMode} onChange={setKindleReaderMode} profilePath={kindleProfilePath} onProfilePathChange={setKindleProfilePath} kofiLinkVisible={kofiLinkVisible} onKofiLinkVisibleChange={setKofiLinkVisible} excludePreReleaseNewReleases={excludePreReleaseNewReleases} onExcludePreReleaseNewReleasesChange={setExcludePreReleaseNewReleases} onClose={() => setSettingsOpen(false)} />
-        : showRightPanel && openedSeries && !selected
+        ? <SettingsPanel mode={kindleReaderMode} onChange={setKindleReaderMode} profilePath={kindleProfilePath} onProfilePathChange={setKindleProfilePath} captureRoot={captureRoot} onCaptureRootChange={setCaptureRoot} kofiLinkVisible={kofiLinkVisible} onKofiLinkVisibleChange={setKofiLinkVisible} excludePreReleaseNewReleases={excludePreReleaseNewReleases} onExcludePreReleaseNewReleasesChange={setExcludePreReleaseNewReleases} onClose={() => setSettingsOpen(false)} />
+        : openedSeries && !selected
         ? <SeriesMetadataPanel
+            key={openedSeries}
             name={openedSeriesName ?? "シリーズ"}
             books={openedSeriesBooks}
-            onClose={() => setRightOpen(false)}
+            preferences={openedSeriesPreferences ?? { key: openedSeries, score: 0, favorite: false }}
+            onPreferencesUpdated={updateSeriesPreferences}
             onUpdated={async (nextName) => {
               await reload();
               if (nextName) setOpenedSeries(seriesKey(nextName));
-              setStatus(`${openedSeriesBooks.length.toLocaleString()}冊のシリーズメタデータを更新しました`);
+              setStatus("シリーズメタデータを更新しました");
             }}
           />
-        : showRightPanel && <MetadataPanel book={selected} onClose={() => setRightOpen(false)} onAdjust={adjust} onFavorite={favorite} onSaved={async () => { await reload(); setStatus("メタデータを保存しました"); }} onOpenKindle={openKindle} />}
+        : <MetadataPanel book={selected} onSeriesSelect={openedSeries ? () => setSelectedId(null) : undefined} onAdjust={adjust} onFavorite={favorite} onSaved={async () => { await reload(); setStatus("メタデータを保存しました"); }} onOpenKindle={openKindle} onCapture={(book) => { setCaptureBook(book); setCaptureOpen(true); }} />}
+      <BackupDialog books={captureBook ? [captureBook] : []} open={captureOpen} batch={false} outputDirectory={captureRoot} onClose={() => setCaptureOpen(false)} />
+      <BackupDialog books={booksInView} open={batchCaptureOpen} batch outputDirectory={captureRoot} onClose={() => setBatchCaptureOpen(false)} />
     </main>
   );
 }
 
-function SeriesMetadataPanel({ name, books, onClose, onUpdated }: {
+function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, onUpdated }: {
   name: string;
   books: Book[];
-  onClose: () => void;
+  preferences: SeriesPreferences;
+  onPreferencesUpdated: (input: SeriesPreferencesInput) => Promise<void>;
   onUpdated: (nextName?: string) => Promise<void>;
 }) {
   const [seriesName, setSeriesName] = useState(name);
@@ -588,11 +636,6 @@ function SeriesMetadataPanel({ name, books, onClose, onUpdated }: {
   const [message, setMessage] = useState("");
   useEffect(() => setSeriesName(name), [name]);
 
-  const scores = books.map((book) => book.score);
-  const minimumScore = scores.length ? Math.min(...scores) : 0;
-  const maximumScore = scores.length ? Math.max(...scores) : 0;
-  const scoreSummary = minimumScore === maximumScore ? String(minimumScore) : `${minimumScore}～${maximumScore}`;
-  const favoriteCount = books.filter((book) => book.favorite).length;
   const hasBooks = books.length > 0;
   const baseInput = (): SeriesMetadataInput => ({
     bookIds: books.map((book) => book.id),
@@ -617,38 +660,68 @@ function SeriesMetadataPanel({ name, books, onClose, onUpdated }: {
       setBusy(false);
     }
   };
+  const updatePreferences = async (scoreDelta: number, favorite: boolean | null = null) => {
+    setBusy(true);
+    setMessage("");
+    try {
+      await onPreferencesUpdated({ key: preferences.key, scoreDelta, favorite });
+      setMessage("シリーズの評価・お気に入りを保存しました");
+    } catch (error) {
+      setMessage(`更新失敗: ${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
   const tags = parseTags(tagText);
   const trimmedSeriesName = seriesName.trim();
 
   return <aside className="panel metadata-panel series-metadata-panel" aria-busy={busy}>
-    <header className="panel-header"><h2>シリーズメタデータ</h2><button className="icon-button" onClick={onClose} aria-label="編集ペインを閉じる">×</button></header>
+    <header className="panel-header"><h2>シリーズメタデータ</h2></header>
     <p className="series-summary"><strong>{name}</strong><span>{books.length}冊</span></p>
+    <label>シリーズの評価スコア<div className="score-editor"><button disabled={busy || !hasBooks} onClick={() => updatePreferences(-1)}>−</button><output>{preferences.score > 0 ? `+${preferences.score}` : preferences.score}</output><button disabled={busy || !hasBooks} onClick={() => updatePreferences(1)}>＋</button></div></label>
+    <button className={`favorite-button ${preferences.favorite ? "active" : ""}`} aria-pressed={preferences.favorite} disabled={busy || !hasBooks} onClick={() => updatePreferences(0, !preferences.favorite)}>{preferences.favorite ? "★ シリーズのお気に入り" : "☆ シリーズをお気に入りに追加"}</button>
+    <p className="hint">シリーズ自身に保存します。各巻の評価・お気に入りは変更しません。</p>
     <label>シリーズ名<input value={seriesName} onChange={(event) => setSeriesName(event.target.value)} /></label>
-    <button className="secondary centered" disabled={busy || !hasBooks || !trimmedSeriesName || trimmedSeriesName === name} onClick={async () => { const ok = await apply({ ...baseInput(), renameTo: trimmedSeriesName }, "シリーズ名を全巻へ適用しました", trimmedSeriesName); if (!ok) return; setSeriesName(trimmedSeriesName); }}>シリーズ名を全巻へ適用</button>
-    <label>全巻の評価スコア<div className="score-editor"><button disabled={busy || !hasBooks} onClick={() => apply({ ...baseInput(), scoreDelta: -1 }, "全巻の評価を -1 しました")}>−</button><output>{scoreSummary}</output><button disabled={busy || !hasBooks} onClick={() => apply({ ...baseInput(), scoreDelta: 1 }, "全巻の評価を +1 しました")}>＋</button></div></label>
-    <div className="series-favorite-summary">お気に入り {favoriteCount} / {books.length}冊</div>
-    <div className="series-button-row"><button disabled={busy || !hasBooks} onClick={() => apply({ ...baseInput(), favorite: true }, "全巻をお気に入りにしました")}>全巻を設定</button><button disabled={busy || !hasBooks} onClick={() => apply({ ...baseInput(), favorite: false }, "全巻のお気に入りを解除しました")}>全巻を解除</button></div>
+    <button className="secondary centered" disabled={busy || !hasBooks || !trimmedSeriesName || trimmedSeriesName === name} onClick={async () => { await apply({ ...baseInput(), renameTo: trimmedSeriesName, renameFromKey: preferences.key, renameToKey: seriesKey(trimmedSeriesName) }, "シリーズ名を全巻へ適用しました", trimmedSeriesName); }}>シリーズ名を全巻へ適用</button>
     <label>一括タグ<textarea rows={3} value={tagText} onChange={(event) => setTagText(event.target.value)} placeholder="カンマ区切り" /></label>
     <div className="series-button-row"><button disabled={busy || !hasBooks || tags.length === 0} onClick={async () => { const ok = await apply({ ...baseInput(), tagsToAdd: tags }, "タグを全巻へ追加しました"); if (ok) setTagText(""); }}>全巻へ追加</button><button disabled={busy || !hasBooks || tags.length === 0} onClick={async () => { const ok = await apply({ ...baseInput(), tagsToRemove: tags }, "タグを全巻から削除しました"); if (ok) setTagText(""); }}>全巻から削除</button></div>
     {message && <p className="hint" role="status">{message}</p>}
-    <p className="hint">この操作は、現在の絞り込みにかかわらずシリーズ全巻の個別メタデータへ反映されます。</p>
+    <p className="hint">シリーズ名と一括タグの操作は、現在の絞り込みにかかわらずシリーズ全巻へ反映されます。</p>
     {!hasBooks && <p className="hint">対象の有効な巻が見つかりませんでした。</p>}
   </aside>;
 }
 
-function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, kofiLinkVisible, onKofiLinkVisibleChange, excludePreReleaseNewReleases, onExcludePreReleaseNewReleasesChange, onClose }: {
+function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, captureRoot, onCaptureRootChange, kofiLinkVisible, onKofiLinkVisibleChange, excludePreReleaseNewReleases, onExcludePreReleaseNewReleasesChange, onClose }: {
   mode: KindleReaderMode;
   onChange: (mode: KindleReaderMode) => void;
   profilePath: string;
   onProfilePathChange: (profilePath: string) => void;
+  captureRoot: string;
+  onCaptureRootChange: (path: string) => void;
   kofiLinkVisible: boolean;
   onKofiLinkVisibleChange: (visible: boolean) => void;
   excludePreReleaseNewReleases: boolean;
   onExcludePreReleaseNewReleasesChange: (exclude: boolean) => void;
   onClose: () => void;
 }) {
+  const [choosingRoot, setChoosingRoot] = useState(false);
+  const [captureError, setCaptureError] = useState("");
   return <aside className="panel settings-panel">
     <header className="panel-header"><h2>設定</h2><button className="icon-button" onClick={onClose} aria-label="設定を閉じる">×</button></header>
+    <section>
+      <h3>バックアップ保存先</h3>
+      <label className="settings-path-label">保存先ルートフォルダー（全体共通）<input value={captureRoot} onChange={(event) => onCaptureRootChange(event.target.value)} placeholder="空欄: ピクチャ\\MMK" spellCheck={false} disabled={choosingRoot} /></label>
+      <button className="secondary centered" disabled={choosingRoot} onClick={async () => {
+        setChoosingRoot(true); setCaptureError("");
+        try { const path = await api.chooseCaptureRoot(captureRoot); if (path !== null) onCaptureRootChange(path); }
+        catch (error) { setCaptureError(String(error)); }
+        finally { setChoosingRoot(false); }
+      }}>保存先ルートフォルダーを選択…</button>
+      <button className="library-link" disabled={choosingRoot || !captureRoot} onClick={() => onCaptureRootChange("")}>既定の保存先に戻す</button>
+      <p className="hint">シリーズ名／書籍名.cbz（シリーズ未設定：シリーズなし／書籍名.cbz）</p>
+      {captureError && <p className="capture-error" role="alert">{captureError}</p>}
+    </section>
+    <BackupSettingsSection />
     <section>
       <h3>Kindleで読むURL</h3>
       <label className="settings-select-label">開き方<select value={mode} onChange={(event) => onChange(event.target.value as KindleReaderMode)}>
@@ -672,27 +745,28 @@ function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, kofiL
     </section>
     <section>
       <h3>表示</h3>
-      <label className="settings-check-label"><input type="checkbox" checked={kofiLinkVisible} onChange={(event) => onKofiLinkVisibleChange(event.target.checked)} />「コーヒーをおごる」リンクを表示</label>
-      <p className="hint">ツールバーの Ko-Fi 寄付リンクの表示を切り替えます。</p>
       <label className="settings-check-label"><input type="checkbox" checked={excludePreReleaseNewReleases} onChange={(event) => onExcludePreReleaseNewReleasesChange(event.target.checked)} />発売前の新刊を除外</label>
       <p className="hint">評価が表示されていない予約商品とみられる新刊候補を表示しません。判定はAmazonカードの評価表示に基づきます。</p>
     </section>
+    <label className="settings-check-label"><input type="checkbox" checked={kofiLinkVisible} onChange={(event) => onKofiLinkVisibleChange(event.target.checked)} />「コーヒーをおごる」リンクを表示</label>
   </aside>;
 }
 
-function MetadataPanel({ book, onClose, onAdjust, onFavorite, onSaved, onOpenKindle }: { book: Book | null; onClose: () => void; onAdjust: (delta: number) => Promise<void>; onFavorite: () => Promise<void>; onSaved: () => Promise<void>; onOpenKindle: (book: Book) => void }) {
+function MetadataPanel({ book, onSeriesSelect, onAdjust, onFavorite, onSaved, onOpenKindle, onCapture }: { book: Book | null; onSeriesSelect?: () => void; onAdjust: (delta: number) => Promise<void>; onFavorite: () => Promise<void>; onSaved: () => Promise<void>; onOpenKindle: (book: Book) => void; onCapture: (book: Book) => void }) {
   const [draft, setDraft] = useState<MetadataInput | null>(null);
   const [saving, setSaving] = useState(false);
   useEffect(() => {
     setDraft(book ? { bookId: book.id, score: book.score, favorite: book.favorite, seriesMode: book.seriesMode, manualSeriesName: book.manualSeriesName, manualSeriesIndex: book.manualSeriesIndex, manualTitle: book.manualTitle, manualAuthors: book.manualAuthors, manualPublisher: book.manualPublisher, tags: book.tags } : null);
   }, [book]);
-  if (!book || !draft) return <aside className="panel metadata-panel"><header className="panel-header"><h2>メタデータ</h2><button className="icon-button" onClick={onClose} aria-label="編集ペインを閉じる">×</button></header><p className="muted">書籍を選択してください</p></aside>;
+  if (!book || !draft) return <aside className="panel metadata-panel"><header className="panel-header"><h2>メタデータ</h2></header><p className="muted">書籍またはシリーズを選択してください</p></aside>;
   const update = <K extends keyof MetadataInput>(key: K, value: MetadataInput[K]) => setDraft({ ...draft, [key]: value });
   const save = async () => { setSaving(true); try { await api.saveMetadata(draft); await onSaved(); } finally { setSaving(false); } };
   return <aside className="panel metadata-panel">
-    <header className="panel-header"><h2>メタデータ</h2><button className="icon-button" onClick={onClose} aria-label="編集ペインを閉じる">×</button></header>
+    <header className="panel-header"><h2>書籍メタデータ</h2></header>
+    {onSeriesSelect && <button className="library-link series-metadata-link" onClick={onSeriesSelect}>← シリーズのメタデータへ</button>}
     <div className="detail-cover"><BookCover book={book} /></div>
     <button className="read-button" onClick={() => onOpenKindle(book)}>Kindleで読む ↗</button>
+    <button className="secondary centered capture-launch" onClick={() => onCapture(book)}>バックアップ…</button>
     <button className="read-button store-button" onClick={() => api.openStorePage(book.asin)}>ストアページを開く ↗</button>
     <button className="library-link" onClick={() => api.openKindleLibrary()}>Kindleライブラリを開く</button>
     <label>評価スコア<div className="score-editor"><button onClick={async () => { await onAdjust(-1); update("score", draft.score - 1); }}>−</button><output>{draft.score > 0 ? `+${draft.score}` : draft.score}</output><button onClick={async () => { await onAdjust(1); update("score", draft.score + 1); }}>＋</button></div></label>

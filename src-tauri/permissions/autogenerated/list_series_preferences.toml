@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-series-preferences"
+description = "Enables the list_series_preferences command without any pre-configured scope."
+commands.allow = ["list_series_preferences"]
+
+[[permission]]
+identifier = "deny-list-series-preferences"
+description = "Denies the list_series_preferences command without any pre-configured scope."
+commands.deny = ["list_series_preferences"]

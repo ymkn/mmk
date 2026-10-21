@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-series-preferences"
+description = "Enables the update_series_preferences command without any pre-configured scope."
+commands.allow = ["update_series_preferences"]
+
+[[permission]]
+identifier = "deny-update-series-preferences"
+description = "Denies the update_series_preferences command without any pre-configured scope."
+commands.deny = ["update_series_preferences"]

@@ -71,6 +71,24 @@ pub struct SeriesMetadataInput {
     pub rename_to: Option<String>,
     pub tags_to_add: Vec<String>,
     pub tags_to_remove: Vec<String>,
+    pub rename_from_key: Option<String>,
+    pub rename_to_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesPreferences {
+    pub key: String,
+    pub score: i64,
+    pub favorite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesPreferencesInput {
+    pub key: String,
+    pub score_delta: i64,
+    pub favorite: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

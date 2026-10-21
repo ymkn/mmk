@@ -1,4 +1,15 @@
-import type { Book } from "./types";
+import type { Book, SeriesPreferences } from "./types";
+
+export type ScoreFilter = "all" | "positive" | "negative";
+
+// A series match includes its volumes without changing their individual metadata.
+export function matchesRatingFilters(book: Book, preferences: SeriesPreferences | undefined, favoriteOnly: boolean, scoreFilter: ScoreFilter): boolean {
+  if (favoriteOnly && !book.favorite && !preferences?.favorite) return false;
+  const scores = [book.score, preferences?.score ?? 0];
+  if (scoreFilter === "positive" && !scores.some((score) => score > 0)) return false;
+  if (scoreFilter === "negative" && !scores.some((score) => score < 0)) return false;
+  return true;
+}
 
 export interface SeriesShelf {
   key: string;
@@ -14,6 +25,13 @@ export interface LibraryShelves {
 
 export function seriesKey(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase("ja").replace(/[\s・:：_\-‐–—]/g, "");
+}
+
+// At the library root, series cards represent every filtered volume in each series.
+export function booksInLibraryView(filtered: Book[], openedSeries: string | null): Book[] {
+  return openedSeries
+    ? filtered.filter((book) => book.effectiveSeriesName && seriesKey(book.effectiveSeriesName) === openedSeries)
+    : filtered;
 }
 
 export function groupBooks(books: Book[]): LibraryShelves {

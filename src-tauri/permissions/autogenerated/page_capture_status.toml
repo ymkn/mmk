@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-page-capture-status"
+description = "Enables the page_capture_status command without any pre-configured scope."
+commands.allow = ["page_capture_status"]
+
+[[permission]]
+identifier = "deny-page-capture-status"
+description = "Denies the page_capture_status command without any pre-configured scope."
+commands.deny = ["page_capture_status"]

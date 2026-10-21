@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-capture-directory"
+description = "Enables the open_capture_directory command without any pre-configured scope."
+commands.allow = ["open_capture_directory"]
+
+[[permission]]
+identifier = "deny-open-capture-directory"
+description = "Denies the open_capture_directory command without any pre-configured scope."
+commands.deny = ["open_capture_directory"]

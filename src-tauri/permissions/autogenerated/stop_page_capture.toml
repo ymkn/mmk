@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-page-capture"
+description = "Enables the stop_page_capture command without any pre-configured scope."
+commands.allow = ["stop_page_capture"]
+
+[[permission]]
+identifier = "deny-stop-page-capture"
+description = "Denies the stop_page_capture command without any pre-configured scope."
+commands.deny = ["stop_page_capture"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-page-capture"
+description = "Enables the start_page_capture command without any pre-configured scope."
+commands.allow = ["start_page_capture"]
+
+[[permission]]
+identifier = "deny-start-page-capture"
+description = "Denies the start_page_capture command without any pre-configured scope."
+commands.deny = ["start_page_capture"]

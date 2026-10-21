@@ -11,12 +11,27 @@
     "allow-adjust-score",
     "allow-set-favorite",
     "allow-update-series-metadata",
+    "allow-list-series-preferences",
+    "allow-update-series-preferences",
     "allow-open-in-kindle",
     "allow-open-amazon-product-page",
     "allow-open-kindle-library",
     "allow-open-kofi-donation",
     "allow-open-amazon-continue-series",
     "allow-list-amazon-continue-series",
-    "allow-clear-amazon-session"
+    "allow-clear-amazon-session",
+    "allow-list-capture-windows",
+    "allow-open-capture-reader",
+    "allow-clear-capture-reader-session",
+    "allow-start-page-capture",
+    "allow-start-batch-capture",
+    "allow-page-capture-status",
+    "allow-stop-page-capture",
+    "allow-open-capture-directory",
+    "allow-preview-capture-layout",
+    "allow-choose-capture-root",
+    "allow-get-backup-settings",
+    "allow-save-backup-settings",
+    "allow-list-pending-backups"
   ]
 }

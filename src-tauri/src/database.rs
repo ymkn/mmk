@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, Transaction};
 
 use crate::models::{
     AmazonContinueSeriesItemInput, AmazonContinueSeriesItemView, BookMetadataInput, BookView,
-    ImportedBook, SeriesMetadataInput, SyncResult,
+    ImportedBook, SeriesMetadataInput, SeriesPreferences, SeriesPreferencesInput, SyncResult,
 };
 use crate::series;
 
@@ -250,6 +250,61 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_series_preferences(&self) -> Result<Vec<SeriesPreferences>, String> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT series_key, score, favorite FROM user_series_metadata ORDER BY series_key",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SeriesPreferences {
+                    key: row.get(0)?,
+                    score: row.get(1)?,
+                    favorite: row.get(2)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn update_series_preferences(
+        &self,
+        input: SeriesPreferencesInput,
+    ) -> Result<SeriesPreferences, String> {
+        if input.key.trim().is_empty() {
+            return Err("シリーズの識別子が空です".to_owned());
+        }
+        if !(-1..=1).contains(&input.score_delta) {
+            return Err("評価の変更量は -1、0、1 のいずれかで指定してください".to_owned());
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction.execute(
+            "INSERT INTO user_series_metadata (series_key, score, favorite, updated_at) VALUES (?1, ?2, COALESCE(?3, 0), ?4) ON CONFLICT(series_key) DO UPDATE SET score=score+excluded.score, favorite=COALESCE(?3, favorite), updated_at=excluded.updated_at",
+            params![input.key, input.score_delta, input.favorite, Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let preferences = transaction
+            .query_row(
+                "SELECT series_key, score, favorite FROM user_series_metadata WHERE series_key=?1",
+                [input.key],
+                |row| {
+                    Ok(SeriesPreferences {
+                        key: row.get(0)?,
+                        score: row.get(1)?,
+                        favorite: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(preferences)
+    }
+
     pub fn update_series_metadata(&self, input: SeriesMetadataInput) -> Result<(), String> {
         let mut book_ids = input.book_ids;
         book_ids.sort_unstable();
@@ -266,6 +321,15 @@ impl Database {
                     .ok_or_else(|| "シリーズ名を空にはできません".to_owned())?,
             ),
             None => None,
+        };
+        let rename_keys = match (input.rename_from_key, input.rename_to_key) {
+            (Some(from), Some(to))
+                if rename_to.is_some() && !from.trim().is_empty() && !to.trim().is_empty() =>
+            {
+                Some((from, to))
+            }
+            (None, None) => None,
+            _ => return Err("シリーズ名変更の識別子が不正です".to_owned()),
         };
 
         let mut connection = self.connect()?;
@@ -305,6 +369,20 @@ impl Database {
             }
             add_tags(&transaction, *book_id, &input.tags_to_add)?;
             remove_tags(&transaction, *book_id, &input.tags_to_remove)?;
+        }
+        if let Some((from, to)) = rename_keys {
+            if from != to {
+                // A conflicting destination must roll back the volume rename as well.
+                transaction.execute(
+                    "UPDATE user_series_metadata SET series_key=?2, updated_at=?3 WHERE series_key=?1",
+                    params![from, to, now],
+                ).map_err(|error| match error {
+                    rusqlite::Error::SqliteFailure(ref code, _)
+                        if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+                        "変更先のシリーズには既に評価・お気に入りが登録されています。シリーズ名の変更を取り消しました".to_owned(),
+                    _ => error.to_string(),
+                })?;
+            }
         }
         transaction.commit().map_err(|error| error.to_string())
     }
@@ -544,6 +622,12 @@ CREATE TABLE IF NOT EXISTS user_book_metadata (
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
+CREATE TABLE IF NOT EXISTS user_series_metadata (
+  series_key TEXT PRIMARY KEY NOT NULL,
+  score INTEGER NOT NULL DEFAULT 0,
+  favorite INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS book_tags (
   book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
   tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
@@ -774,6 +858,8 @@ mod tests {
                 rename_to: Some("星巡り・新装版".to_owned()),
                 tags_to_add: vec!["全巻所有".to_owned()],
                 tags_to_remove: Vec::new(),
+                rename_from_key: None,
+                rename_to_key: None,
             })
             .unwrap();
 
@@ -817,6 +903,8 @@ mod tests {
             rename_to: Some("更新後シリーズ".to_owned()),
             tags_to_add: vec!["ロールバック確認".to_owned()],
             tags_to_remove: Vec::new(),
+            rename_from_key: None,
+            rename_to_key: None,
         });
 
         assert!(error.is_err());
@@ -827,6 +915,136 @@ mod tests {
                 && book.effective_series_name.as_deref() == Some("星巡り")
                 && book.tags.is_empty()
         }));
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn series_preferences_are_independent_and_survive_sync_and_restart() {
+        let (database, path) = test_database();
+        let source = [
+            imported_with("B012345671", "星巡り 1", 1.0),
+            imported_with("B012345672", "星巡り 2", 2.0),
+        ];
+        database
+            .sync(Path::new("metadata.xml"), &source, 0)
+            .unwrap();
+        let books = database.list_books().unwrap();
+        database.adjust_score(books[0].id, -2).unwrap();
+        database.set_favorite(books[0].id, true).unwrap();
+        database
+            .update_series_preferences(SeriesPreferencesInput {
+                key: "星巡り".to_owned(),
+                score_delta: 1,
+                favorite: Some(true),
+            })
+            .unwrap();
+        let updated = database
+            .update_series_preferences(SeriesPreferencesInput {
+                key: "星巡り".to_owned(),
+                score_delta: 1,
+                favorite: None,
+            })
+            .unwrap();
+        assert_eq!(updated.score, 2);
+        assert!(updated.favorite);
+        database
+            .sync(Path::new("metadata.xml"), &source, 0)
+            .unwrap();
+        drop(database);
+        let database = Database::initialize(path.clone()).unwrap();
+        let preferences = database.list_series_preferences().unwrap();
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(preferences[0].score, 2);
+        assert!(preferences[0].favorite);
+        let books = database.list_books().unwrap();
+        assert_eq!(books[0].score, -2);
+        assert!(books[0].favorite);
+        assert_eq!(books[1].score, 0);
+        assert!(!books[1].favorite);
+        let updated = database
+            .update_series_preferences(SeriesPreferencesInput {
+                key: "星巡り".to_owned(),
+                score_delta: -1,
+                favorite: Some(false),
+            })
+            .unwrap();
+        assert_eq!(updated.score, 1);
+        assert!(!updated.favorite);
+        assert!(database.list_books().unwrap()[0].favorite);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn series_rename_moves_preferences_and_conflicts_roll_back() {
+        let (database, path) = test_database();
+        database
+            .sync(Path::new("metadata.xml"), &[imported("星巡り 1")], 0)
+            .unwrap();
+        let book_id = database.list_books().unwrap()[0].id;
+        database
+            .update_series_preferences(SeriesPreferencesInput {
+                key: "星巡り".to_owned(),
+                score_delta: 1,
+                favorite: Some(true),
+            })
+            .unwrap();
+        let rename = |from: &str, to: &str| SeriesMetadataInput {
+            book_ids: vec![book_id],
+            score_delta: 0,
+            favorite: None,
+            rename_to: Some(to.to_owned()),
+            tags_to_add: Vec::new(),
+            tags_to_remove: Vec::new(),
+            rename_from_key: Some(from.to_owned()),
+            rename_to_key: Some(to.to_owned()),
+        };
+        database
+            .update_series_metadata(rename("星巡り", "新装版"))
+            .unwrap();
+        let preferences = database.list_series_preferences().unwrap();
+        assert_eq!(preferences[0].key, "新装版");
+        assert_eq!(preferences[0].score, 1);
+        assert!(preferences[0].favorite);
+        assert_eq!(database.list_books().unwrap()[0].score, 0);
+        database
+            .update_series_preferences(SeriesPreferencesInput {
+                key: "変更先".to_owned(),
+                score_delta: -1,
+                favorite: Some(false),
+            })
+            .unwrap();
+        assert!(database
+            .update_series_metadata(rename("新装版", "変更先"))
+            .is_err());
+        assert_eq!(
+            database.list_books().unwrap()[0]
+                .effective_series_name
+                .as_deref(),
+            Some("新装版")
+        );
+        assert_eq!(database.list_series_preferences().unwrap().len(), 2);
+        database
+            .update_series_metadata(rename("新装版", "新装版"))
+            .unwrap();
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn series_preferences_reject_invalid_updates() {
+        let (database, path) = test_database();
+        for (key, delta) in [(" ", 0), ("星巡り", 2), ("星巡り", -2)] {
+            assert!(database
+                .update_series_preferences(SeriesPreferencesInput {
+                    key: key.to_owned(),
+                    score_delta: delta,
+                    favorite: Some(true),
+                })
+                .is_err());
+        }
+        assert!(database.list_series_preferences().unwrap().is_empty());
         drop(database);
         let _ = fs::remove_file(path);
     }
