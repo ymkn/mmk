@@ -10,6 +10,8 @@ Windows 版 Kindle のローカルメタデータを読み取り、自分用の�
 - タイトル・著者・タグ・ASIN の検索
 - お気に入り、正負の評価スコア、タグ
 - タイトルからのシリーズ推定とシリーズ単位の棚表示
+- シリーズの備考メモ（入力時に自動保存）、メモの有無による絞り込み
+- 検索語・お気に入り・評価・メモ有無・著者・出版社・レーベル・タグの絞り込み条件を次回起動時に復元
 - メタデータ（タイトル、著者、出版社、シリーズ名、巻数）は手動で管理可能
 - ログインするとシリーズの新刊情報を取得可能（Amazon の「読み始めたシリーズの続きを読むにはこちら」がソース）、ストアページを開くリンク付き
 - 正規Kindle Cloud Readerに表示された書籍のスクリーンショットからCBZバックアップを生成（Windows）
@@ -147,6 +149,7 @@ node --test tests\backup-scope.test.mjs
 node --test src-tauri\tests\reader-page-render.test.mjs
 node --test src-tauri\tests\reader-input-regression.test.mjs
 node --test tests\version.test.mjs
+node --test tests\series-notes.test.mjs tests\card-metadata.test.mjs
 ```
 
 実ユーザーの Kindle キャッシュを読み取り専用で parser に通す確認:

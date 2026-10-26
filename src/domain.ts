@@ -1,6 +1,12 @@
 import type { Book, SeriesPreferences } from "./types";
 
 export type ScoreFilter = "all" | "positive" | "negative";
+export type NoteFilter = "all" | "with-note" | "without-note";
+
+export function matchesNoteFilter(preferences: SeriesPreferences | undefined, filter: NoteFilter): boolean {
+  const hasNote = Boolean(preferences?.note?.trim());
+  return filter === "all" || (filter === "with-note" ? hasNote : !hasNote);
+}
 
 // A series match includes its volumes without changing their individual metadata.
 export function matchesRatingFilters(book: Book, preferences: SeriesPreferences | undefined, favoriteOnly: boolean, scoreFilter: ScoreFilter): boolean {
