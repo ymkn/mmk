@@ -1,11 +1,13 @@
 {
   "name": "mmk",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --port 1420",
     "build": "tsc --noEmit && vite build",
     "build:exe": "tauri build --no-bundle",
+    "version": "node scripts/sync-version.mjs && git add src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock",
     "tauri": "tauri"
   },
   "dependencies": {

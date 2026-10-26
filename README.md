@@ -28,7 +28,7 @@ Windows 版 Kindle のローカルメタデータを読み取り、自分用の�
 
 ReleasesからダウンロードしたZIPを展開し、mmk.exeを実行、「Kindleと同期」ボタンを押してください。
 
-公式アプリが古い場合や設定を変えている場合、同期に失敗することがあります。その場合は歯車アイコンから設定ペインを開き、`KindleSyncMetadataCache.xml`の場所を設定してください。
+公式アプリが古い場合や設定を変えている場合、同期に失敗することがあります。その場合は歯車アイコンから設定ペインを開き、`KindleSyncMetadataCache.xml`の場所を設定してください。アプリのバージョンは設定ペインの一番下に表示します。
 
 ## 開発環境
 
@@ -125,6 +125,16 @@ pnpm build:exe
 出力は `src-tauri\target\release\mmk.exe` です。
 この exe はフロントエンド資産と SQLite を内包しているため、`dist` や Node.js を同じ場所へ置かずに起動できます。Tauri の Windows 実行基盤である WebView2 Runtime だけは OS 側の依存関係として残ります。
 
+## バージョン更新
+
+`package.json` をバージョンの管理元とし、`npm version` のフックで Tauri 設定・`Cargo.toml`・`Cargo.lock` へ同期します。依存関係の管理は引き続き pnpm を使います。
+
+```powershell
+npm version minor --no-git-tag-version
+```
+
+開発ブランチで実行し、Debug・Release ビルドを順番に検証してから、変更ファイルをコミットし、対応する `vX.Y.Z` タグを作成します。`--no-git-tag-version` を省くと npm がコミットとタグを自動作成します（検証前の自動作成を避けるため、通常は指定します）。
+
 ## テスト
 
 ```powershell
@@ -136,6 +146,7 @@ node --test tests\command-acl.test.mjs
 node --test tests\backup-scope.test.mjs
 node --test src-tauri\tests\reader-page-render.test.mjs
 node --test src-tauri\tests\reader-input-regression.test.mjs
+node --test tests\version.test.mjs
 ```
 
 実ユーザーの Kindle キャッシュを読み取り専用で parser に通す確認:

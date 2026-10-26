@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
@@ -706,6 +707,15 @@ function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, captu
 }) {
   const [choosingRoot, setChoosingRoot] = useState(false);
   const [captureError, setCaptureError] = useState("");
+  const [appVersion, setAppVersion] = useState("読み込み中…");
+  useEffect(() => {
+    let active = true;
+    getVersion().then(
+      (version) => { if (active) setAppVersion(version); },
+      () => { if (active) setAppVersion("取得できませんでした"); },
+    );
+    return () => { active = false; };
+  }, []);
   return <aside className="panel settings-panel">
     <header className="panel-header"><h2>設定</h2><button className="icon-button" onClick={onClose} aria-label="設定を閉じる">×</button></header>
     <section>
@@ -749,6 +759,10 @@ function SettingsPanel({ mode, onChange, profilePath, onProfilePathChange, captu
       <p className="hint">評価が表示されていない予約商品とみられる新刊候補を表示しません。判定はAmazonカードの評価表示に基づきます。</p>
     </section>
     <label className="settings-check-label"><input type="checkbox" checked={kofiLinkVisible} onChange={(event) => onKofiLinkVisibleChange(event.target.checked)} />「コーヒーをおごる」リンクを表示</label>
+    <footer className="settings-version muted" aria-label="バージョン情報">
+      <strong>Manga Manager for Kindle</strong>
+      <span role="status">バージョン {appVersion}</span>
+    </footer>
   </aside>;
 }
 
