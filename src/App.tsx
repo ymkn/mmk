@@ -229,7 +229,7 @@ function SeriesCard({ series, preferences, onSelect }: { series: SeriesShelf; pr
   return <button className="series-card" onClick={onSelect}>
     <div className="series-cover"><BookCover book={series.coverBook} /><span className="book-stack" /></div>
     <span className="book-title">{series.name}</span><span className="muted">{series.books.length}冊</span>
-    <span className="card-meta"><span>{preferences?.favorite ? "★" : "☆"}</span><span>シリーズ評価 {score > 0 ? `+${score}` : score}</span></span>
+    <span className="card-meta"><span>{preferences?.favorite ? "★" : "☆"}</span><span>シリーズ評価 {score > 0 ? `+${score}` : score}</span>{preferences?.note?.trim() ? <span>メモあり</span> : null}</span>
   </button>;
 }
 
@@ -609,7 +609,7 @@ function App() {
             key={openedSeries}
             name={openedSeriesName ?? "シリーズ"}
             books={openedSeriesBooks}
-            preferences={openedSeriesPreferences ?? { key: openedSeries, score: 0, favorite: false }}
+            preferences={openedSeriesPreferences ?? { key: openedSeries, score: 0, favorite: false, note: "" }}
             onPreferencesUpdated={updateSeriesPreferences}
             onUpdated={async (nextName) => {
               await reload();
@@ -633,9 +633,11 @@ function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, o
 }) {
   const [seriesName, setSeriesName] = useState(name);
   const [tagText, setTagText] = useState("");
+  const [noteText, setNoteText] = useState(preferences.note);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   useEffect(() => setSeriesName(name), [name]);
+  useEffect(() => setNoteText(preferences.note), [preferences.note]);
 
   const hasBooks = books.length > 0;
   const baseInput = (): SeriesMetadataInput => ({
@@ -665,8 +667,20 @@ function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, o
     setBusy(true);
     setMessage("");
     try {
-      await onPreferencesUpdated({ key: preferences.key, scoreDelta, favorite });
+      await onPreferencesUpdated({ key: preferences.key, scoreDelta, favorite, note: null });
       setMessage("シリーズの評価・お気に入りを保存しました");
+    } catch (error) {
+      setMessage(`更新失敗: ${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveNote = async () => {
+    setBusy(true);
+    setMessage("");
+    try {
+      await onPreferencesUpdated({ key: preferences.key, scoreDelta: 0, favorite: null, note: noteText });
+      setMessage("シリーズの備考を保存しました");
     } catch (error) {
       setMessage(`更新失敗: ${String(error)}`);
     } finally {
@@ -682,6 +696,8 @@ function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, o
     <label>シリーズの評価スコア<div className="score-editor"><button disabled={busy || !hasBooks} onClick={() => updatePreferences(-1)}>−</button><output>{preferences.score > 0 ? `+${preferences.score}` : preferences.score}</output><button disabled={busy || !hasBooks} onClick={() => updatePreferences(1)}>＋</button></div></label>
     <button className={`favorite-button ${preferences.favorite ? "active" : ""}`} aria-pressed={preferences.favorite} disabled={busy || !hasBooks} onClick={() => updatePreferences(0, !preferences.favorite)}>{preferences.favorite ? "★ シリーズのお気に入り" : "☆ シリーズをお気に入りに追加"}</button>
     <p className="hint">シリーズ自身に保存します。各巻の評価・お気に入りは変更しません。</p>
+    <label>シリーズの備考<textarea rows={3} value={noteText} onChange={(event) => setNoteText(event.target.value)} placeholder="どういう話だったか、どこまで読んだかなど" /></label>
+    <button className="secondary centered" disabled={busy || noteText === preferences.note} onClick={saveNote}>備考を保存</button>
     <label>シリーズ名<input value={seriesName} onChange={(event) => setSeriesName(event.target.value)} /></label>
     <button className="secondary centered" disabled={busy || !hasBooks || !trimmedSeriesName || trimmedSeriesName === name} onClick={async () => { await apply({ ...baseInput(), renameTo: trimmedSeriesName, renameFromKey: preferences.key, renameToKey: seriesKey(trimmedSeriesName) }, "シリーズ名を全巻へ適用しました", trimmedSeriesName); }}>シリーズ名を全巻へ適用</button>
     <label>一括タグ<textarea rows={3} value={tagText} onChange={(event) => setTagText(event.target.value)} placeholder="カンマ区切り" /></label>

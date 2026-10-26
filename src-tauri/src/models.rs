@@ -81,6 +81,7 @@ pub struct SeriesPreferences {
     pub key: String,
     pub score: i64,
     pub favorite: bool,
+    pub note: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +90,8 @@ pub struct SeriesPreferencesInput {
     pub key: String,
     pub score_delta: i64,
     pub favorite: Option<bool>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
