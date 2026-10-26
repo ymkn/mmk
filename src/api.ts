@@ -1,10 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createBackupSettingsStore } from "./backupSettingsStore";
-import type { AmazonContinueSeriesItem, BackupSettings, BatchCaptureOptions, Book, CaptureOptions, CapturePreview, CaptureStatus, CaptureWindow, KindleOpenKind, MetadataInput, SeriesMetadataInput, SeriesPreferences, SeriesPreferencesInput, SyncResult } from "./types";
+import { createSeriesPreferencesStore } from "./seriesPreferencesStore";
+import type { AmazonContinueSeriesItem, BackupSettings, BatchCaptureOptions, Book, CaptureOptions, CapturePreview, CaptureStatus, CaptureWindow, KindleOpenKind, MetadataInput, SeriesMetadataInput, SeriesPreferences, SyncResult } from "./types";
 
 const backupSettings = createBackupSettingsStore(
   () => invoke<BackupSettings>("get_backup_settings"),
   (settings) => invoke<void>("save_backup_settings", { settings }),
+);
+
+const seriesPreferences = createSeriesPreferencesStore(
+  () => invoke<SeriesPreferences[]>("list_series_preferences"),
+  (input) => invoke<SeriesPreferences>("update_series_preferences", { input }),
 );
 
 export const api = {
@@ -13,9 +19,9 @@ export const api = {
   saveMetadata: (input: MetadataInput) => invoke<void>("save_book_metadata", { input }),
   adjustScore: (bookId: number, delta: number) => invoke<number>("adjust_score", { bookId, delta }),
   setFavorite: (bookId: number, favorite: boolean) => invoke<void>("set_favorite", { bookId, favorite }),
-  updateSeriesMetadata: (input: SeriesMetadataInput) => invoke<void>("update_series_metadata", { input }),
-  listSeriesPreferences: () => invoke<SeriesPreferences[]>("list_series_preferences"),
-  updateSeriesPreferences: (input: SeriesPreferencesInput) => invoke<SeriesPreferences>("update_series_preferences", { input }),
+  updateSeriesMetadata: (input: SeriesMetadataInput) => seriesPreferences.afterPending(() => invoke<void>("update_series_metadata", { input })),
+  listSeriesPreferences: seriesPreferences.load,
+  updateSeriesPreferences: seriesPreferences.save,
   openInKindle: (asin: string, kind: KindleOpenKind) => invoke<void>("open_in_kindle", { asin, kind }),
   openStorePage: (asin: string) => invoke<void>("open_amazon_product_page", { asin }),
   openKindleLibrary: () => invoke<void>("open_kindle_library"),

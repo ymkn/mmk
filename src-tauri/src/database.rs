@@ -53,6 +53,14 @@ impl Database {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        if !table_has_column(&connection, "user_series_metadata", "note")? {
+            connection
+                .execute(
+                    "ALTER TABLE user_series_metadata ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         if !table_has_column(&connection, "amazon_continue_series_items", "has_rating")? {
             connection
                 .execute(
@@ -254,7 +262,7 @@ impl Database {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT series_key, score, favorite FROM user_series_metadata ORDER BY series_key",
+                "SELECT series_key, score, favorite, note FROM user_series_metadata ORDER BY series_key",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -263,6 +271,7 @@ impl Database {
                     key: row.get(0)?,
                     score: row.get(1)?,
                     favorite: row.get(2)?,
+                    note: row.get(3)?,
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -285,18 +294,19 @@ impl Database {
             .transaction()
             .map_err(|error| error.to_string())?;
         transaction.execute(
-            "INSERT INTO user_series_metadata (series_key, score, favorite, updated_at) VALUES (?1, ?2, COALESCE(?3, 0), ?4) ON CONFLICT(series_key) DO UPDATE SET score=score+excluded.score, favorite=COALESCE(?3, favorite), updated_at=excluded.updated_at",
-            params![input.key, input.score_delta, input.favorite, Utc::now().to_rfc3339()],
+            "INSERT INTO user_series_metadata (series_key, score, favorite, note, updated_at) VALUES (?1, ?2, COALESCE(?3, 0), COALESCE(?5, ''), ?4) ON CONFLICT(series_key) DO UPDATE SET score=score+excluded.score, favorite=COALESCE(?3, favorite), note=COALESCE(?5, note), updated_at=excluded.updated_at",
+            params![input.key, input.score_delta, input.favorite, Utc::now().to_rfc3339(), input.note],
         ).map_err(|error| error.to_string())?;
         let preferences = transaction
             .query_row(
-                "SELECT series_key, score, favorite FROM user_series_metadata WHERE series_key=?1",
+                "SELECT series_key, score, favorite, note FROM user_series_metadata WHERE series_key=?1",
                 [input.key],
                 |row| {
                     Ok(SeriesPreferences {
                         key: row.get(0)?,
                         score: row.get(1)?,
                         favorite: row.get(2)?,
+                        note: row.get(3)?,
                     })
                 },
             )
@@ -626,6 +636,7 @@ CREATE TABLE IF NOT EXISTS user_series_metadata (
   series_key TEXT PRIMARY KEY NOT NULL,
   score INTEGER NOT NULL DEFAULT 0,
   favorite INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS book_tags (
@@ -937,6 +948,7 @@ mod tests {
                 key: "星巡り".to_owned(),
                 score_delta: 1,
                 favorite: Some(true),
+                note: Some("宇宙を巡る冒険もの".to_owned()),
             })
             .unwrap();
         let updated = database
@@ -944,10 +956,12 @@ mod tests {
                 key: "星巡り".to_owned(),
                 score_delta: 1,
                 favorite: None,
+                note: None,
             })
             .unwrap();
         assert_eq!(updated.score, 2);
         assert!(updated.favorite);
+        assert_eq!(updated.note, "宇宙を巡る冒険もの");
         database
             .sync(Path::new("metadata.xml"), &source, 0)
             .unwrap();
@@ -957,6 +971,7 @@ mod tests {
         assert_eq!(preferences.len(), 1);
         assert_eq!(preferences[0].score, 2);
         assert!(preferences[0].favorite);
+        assert_eq!(preferences[0].note, "宇宙を巡る冒険もの");
         let books = database.list_books().unwrap();
         assert_eq!(books[0].score, -2);
         assert!(books[0].favorite);
@@ -967,10 +982,12 @@ mod tests {
                 key: "星巡り".to_owned(),
                 score_delta: -1,
                 favorite: Some(false),
+                note: Some(String::new()),
             })
             .unwrap();
         assert_eq!(updated.score, 1);
         assert!(!updated.favorite);
+        assert_eq!(updated.note, "");
         assert!(database.list_books().unwrap()[0].favorite);
         drop(database);
         let _ = fs::remove_file(path);
@@ -988,6 +1005,7 @@ mod tests {
                 key: "星巡り".to_owned(),
                 score_delta: 1,
                 favorite: Some(true),
+                note: None,
             })
             .unwrap();
         let rename = |from: &str, to: &str| SeriesMetadataInput {
@@ -1013,6 +1031,7 @@ mod tests {
                 key: "変更先".to_owned(),
                 score_delta: -1,
                 favorite: Some(false),
+                note: None,
             })
             .unwrap();
         assert!(database
@@ -1041,6 +1060,7 @@ mod tests {
                     key: key.to_owned(),
                     score_delta: delta,
                     favorite: Some(true),
+                    note: None,
                 })
                 .is_err());
         }

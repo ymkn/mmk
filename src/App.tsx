@@ -5,9 +5,10 @@ import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, ty
 import { api } from "./api";
 import { BackupDialog } from "./BackupDialog";
 import { BackupSettingsSection } from "./BackupSettings";
+import { CardMetadata } from "./CardMetadata";
 import { readCaptureRoot, writeCaptureRoot } from "./captureSettings";
-import { booksInLibraryView, groupBooks, matchesRatingFilters, seriesKey, type ScoreFilter, type SeriesShelf } from "./domain";
-import { readFilterSections, writeFilterSections, type FilterSections } from "./filterSettings";
+import { booksInLibraryView, groupBooks, matchesNoteFilter, matchesRatingFilters, seriesKey, type NoteFilter, type ScoreFilter, type SeriesShelf } from "./domain";
+import { readFilterSections, readLibraryFilters, writeFilterSections, writeLibraryFilters, type FilterSections } from "./filterSettings";
 import type { AmazonContinueSeriesItem, Book, KindleOpenKind, KindleReaderMode, MetadataInput, SeriesMetadataInput, SeriesMode, SeriesPreferences, SeriesPreferencesInput, SyncResult } from "./types";
 
 type LibraryView = "library" | "new-releases";
@@ -219,7 +220,7 @@ function BookCard({ book, selected, onSelect, onOpenKindle }: { book: Book; sele
       <BookCover book={book} />
       <span className="book-title">{book.title}</span>
       <span className="muted one-line">{book.authors.join("、") || "著者不明"}</span>
-      <span className="card-meta"><span>{book.favorite ? "★" : "☆"}</span><span>評価 {book.score > 0 ? `+${book.score}` : book.score}</span></span>
+      <CardMetadata score={book.score} favorite={book.favorite} />
     </button>
   );
 }
@@ -229,7 +230,7 @@ function SeriesCard({ series, preferences, onSelect }: { series: SeriesShelf; pr
   return <button className="series-card" onClick={onSelect}>
     <div className="series-cover"><BookCover book={series.coverBook} /><span className="book-stack" /></div>
     <span className="book-title">{series.name}</span><span className="muted">{series.books.length}冊</span>
-    <span className="card-meta"><span>{preferences?.favorite ? "★" : "☆"}</span><span>シリーズ評価 {score > 0 ? `+${score}` : score}</span></span>
+    <CardMetadata score={score} favorite={preferences?.favorite ?? false} note={preferences?.note} series />
   </button>;
 }
 
@@ -247,15 +248,18 @@ function formatPrice(price: number | null): string {
 function App() {
   const [books, setBooks] = useState<Book[]>([]);
   const [seriesPreferences, setSeriesPreferences] = useState<SeriesPreferences[]>([]);
+  const [seriesNoteDrafts, setSeriesNoteDrafts] = useState<Map<string, { note: string }>>(new Map());
   const [amazonItems, setAmazonItems] = useState<AmazonContinueSeriesItem[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [query, setQuery] = useState("");
-  const [favoriteOnly, setFavoriteOnly] = useState(false);
-  const [scoreFilter, setScoreFilter] = useState<ScoreFilter>("all");
-  const [selectedAuthors, setSelectedAuthors] = useState<Set<string>>(new Set());
-  const [selectedPublishers, setSelectedPublishers] = useState<Set<string>>(new Set());
-  const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
-  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
+  const [initialFilters] = useState(() => readLibraryFilters());
+  const [query, setQuery] = useState(initialFilters.query);
+  const [favoriteOnly, setFavoriteOnly] = useState(initialFilters.favoriteOnly);
+  const [scoreFilter, setScoreFilter] = useState<ScoreFilter>(initialFilters.scoreFilter);
+  const [noteFilter, setNoteFilter] = useState<NoteFilter>(initialFilters.noteFilter);
+  const [selectedAuthors, setSelectedAuthors] = useState<Set<string>>(initialFilters.selectedAuthors);
+  const [selectedPublishers, setSelectedPublishers] = useState<Set<string>>(initialFilters.selectedPublishers);
+  const [selectedLabels, setSelectedLabels] = useState<Set<string>>(initialFilters.selectedLabels);
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(initialFilters.selectedTags);
   const [openedSeries, setOpenedSeries] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<LibraryView>("library");
   const [filterSections, setFilterSections] = useState(() => readFilterSections());
@@ -276,6 +280,9 @@ function App() {
 
   useEffect(() => { writeCaptureRoot(captureRoot); }, [captureRoot]);
   useEffect(() => { writeFilterSections(filterSections); }, [filterSections]);
+  useEffect(() => {
+    writeLibraryFilters({ query, favoriteOnly, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags });
+  }, [query, favoriteOnly, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
 
   const reload = async () => {
     const [result, recommendations, preferences] = await Promise.all([
@@ -395,7 +402,13 @@ function App() {
   const toggleFilterSection = (key: keyof FilterSections) => {
     setFilterSections((current) => ({ ...current, [key]: !current[key] }));
   };
-  const preferencesByKey = useMemo(() => new Map(seriesPreferences.map((item) => [item.key, item])), [seriesPreferences]);
+  const preferencesByKey = useMemo(() => {
+    const result = new Map(seriesPreferences.map((item) => [item.key, item]));
+    for (const [key, draft] of seriesNoteDrafts) {
+      result.set(key, { ...(result.get(key) ?? { key, score: 0, favorite: false }), note: draft.note });
+    }
+    return result;
+  }, [seriesPreferences, seriesNoteDrafts]);
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase("ja");
@@ -403,6 +416,7 @@ function App() {
       if (book.sourceStatus !== "active") return false;
       const preferences = book.effectiveSeriesName ? preferencesByKey.get(seriesKey(book.effectiveSeriesName)) : undefined;
       if (!matchesRatingFilters(book, preferences, favoriteOnly, scoreFilter)) return false;
+      if (!matchesNoteFilter(preferences, noteFilter)) return false;
       if (selectedAuthors.size > 0 && !book.authors.some((author) => selectedAuthors.has(author))) return false;
       if (selectedPublishers.size > 0 && (!book.publisher || !selectedPublishers.has(book.publisher))) return false;
       if (selectedLabels.size > 0 && (!book.label || !selectedLabels.has(book.label))) return false;
@@ -411,7 +425,7 @@ function App() {
       return [book.title, book.authors.join(" "), book.publisher ?? "", book.asin, book.effectiveSeriesName ?? "", book.tags.join(" ")]
         .join(" ").toLocaleLowerCase("ja").includes(needle);
     });
-  }, [books, preferencesByKey, favoriteOnly, query, scoreFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
+  }, [books, preferencesByKey, favoriteOnly, query, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
 
   const shelves = useMemo(() => groupBooks(filtered), [filtered]);
   const newReleaseSeries = useMemo<NewReleaseSeries[]>(() => {
@@ -503,15 +517,29 @@ function App() {
     patchBook(selected.id, { favorite: value });
   };
   const updateSeriesPreferences = async (input: SeriesPreferencesInput) => {
-    const updated = await api.updateSeriesPreferences(input);
-    setSeriesPreferences((current) => [...current.filter((item) => item.key !== updated.key), updated]);
+    const draft = input.note === null ? null : { note: input.note };
+    if (draft) setSeriesNoteDrafts((current) => new Map(current).set(input.key, draft));
+    try {
+      const updated = await api.updateSeriesPreferences(input);
+      setSeriesPreferences((current) => [...current.filter((item) => item.key !== updated.key), updated]);
+      if (draft) setSeriesNoteDrafts((current) => {
+        if (current.get(input.key) !== draft) return current;
+        const next = new Map(current);
+        next.delete(input.key);
+        return next;
+      });
+    } catch (error) {
+      setStatus(`シリーズの保存に失敗: ${String(error)}`);
+      throw error;
+    }
   };
 
-  const hasActiveFilters = query.trim() !== "" || favoriteOnly || scoreFilter !== "all" || selectedAuthors.size > 0 || selectedPublishers.size > 0 || selectedLabels.size > 0 || selectedTags.size > 0;
+  const hasActiveFilters = query.trim() !== "" || favoriteOnly || scoreFilter !== "all" || noteFilter !== "all" || selectedAuthors.size > 0 || selectedPublishers.size > 0 || selectedLabels.size > 0 || selectedTags.size > 0;
   const clearFilters = () => {
     setQuery("");
     setFavoriteOnly(false);
     setScoreFilter("all");
+    setNoteFilter("all");
     setSelectedAuthors(new Set());
     setSelectedPublishers(new Set());
     setSelectedLabels(new Set());
@@ -527,6 +555,7 @@ function App() {
     query.trim() && { key: "query", label: `検索: ${query.trim()}` },
     favoriteOnly && { key: "favorite", label: "★ お気に入り" },
     scoreFilter !== "all" && { key: "score", label: scoreFilter === "positive" ? "評価 ＋" : "評価 −" },
+    noteFilter !== "all" && { key: "notes", label: noteFilter === "with-note" ? "メモあり" : "メモなし" },
     selectedAuthors.size > 0 && { key: "authors", label: `著者: ${[...selectedAuthors].join("、")}` },
     selectedPublishers.size > 0 && { key: "publishers", label: `出版社: ${[...selectedPublishers].join("、")}` },
     selectedLabels.size > 0 && { key: "labels", label: `レーベル: ${[...selectedLabels].join("、")}` },
@@ -552,6 +581,13 @@ function App() {
           <button className={scoreFilter === "positive" ? "active" : ""} onClick={() => setScoreFilter("positive")}>＋</button>
           <button className={scoreFilter === "negative" ? "active" : ""} onClick={() => setScoreFilter("negative")}>−</button>
         </div><p className="muted rating-filter-hint">書籍またはシリーズの登録が対象です。</p></FilterSection>
+        <FilterSection id="notes" title="メモ" open={filterSections.notes} count={Number(noteFilter !== "all")} onToggle={() => toggleFilterSection("notes")}>
+          <div className="segmented" role="group" aria-label="シリーズメモの有無">
+            <button className={noteFilter === "all" ? "active" : ""} aria-pressed={noteFilter === "all"} onClick={() => setNoteFilter("all")}>すべて</button>
+            <button className={noteFilter === "with-note" ? "active" : ""} aria-pressed={noteFilter === "with-note"} onClick={() => setNoteFilter("with-note")}>あり</button>
+            <button className={noteFilter === "without-note" ? "active" : ""} aria-pressed={noteFilter === "without-note"} onClick={() => setNoteFilter("without-note")}>なし</button>
+          </div><p className="muted rating-filter-hint">シリーズの備考で絞り込みます。</p>
+        </FilterSection>
         <FilterSection id="authors" title="著者" open={filterSections.authors} count={selectedAuthors.size} onToggle={() => toggleFilterSection("authors")}><FacetList items={authorCounts} selected={selectedAuthors} emptyText="著者情報はありません" onToggle={(value) => toggleFacet(setSelectedAuthors, value)} /></FilterSection>
         <FilterSection id="publishers" title="出版社" open={filterSections.publishers} count={selectedPublishers.size} onToggle={() => toggleFilterSection("publishers")}><FacetList items={publisherCounts} selected={selectedPublishers} emptyText="出版社情報はありません" onToggle={(value) => toggleFacet(setSelectedPublishers, value)} /></FilterSection>
         <FilterSection id="labels" title="レーベル" open={filterSections.labels} count={selectedLabels.size} onToggle={() => toggleFilterSection("labels")}><FacetList items={labelCounts} selected={selectedLabels} emptyText="レーベル情報はありません" onToggle={(value) => toggleFacet(setSelectedLabels, value)} /></FilterSection>
@@ -609,7 +645,7 @@ function App() {
             key={openedSeries}
             name={openedSeriesName ?? "シリーズ"}
             books={openedSeriesBooks}
-            preferences={openedSeriesPreferences ?? { key: openedSeries, score: 0, favorite: false }}
+            preferences={openedSeriesPreferences ?? { key: openedSeries, score: 0, favorite: false, note: "" }}
             onPreferencesUpdated={updateSeriesPreferences}
             onUpdated={async (nextName) => {
               await reload();
@@ -633,6 +669,7 @@ function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, o
 }) {
   const [seriesName, setSeriesName] = useState(name);
   const [tagText, setTagText] = useState("");
+  const noteSaveVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   useEffect(() => setSeriesName(name), [name]);
@@ -665,12 +702,22 @@ function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, o
     setBusy(true);
     setMessage("");
     try {
-      await onPreferencesUpdated({ key: preferences.key, scoreDelta, favorite });
+      await onPreferencesUpdated({ key: preferences.key, scoreDelta, favorite, note: null });
       setMessage("シリーズの評価・お気に入りを保存しました");
     } catch (error) {
       setMessage(`更新失敗: ${String(error)}`);
     } finally {
       setBusy(false);
+    }
+  };
+  const saveNote = async (note: string) => {
+    const version = ++noteSaveVersion.current;
+    setMessage("シリーズの備考を保存中…");
+    try {
+      await onPreferencesUpdated({ key: preferences.key, scoreDelta: 0, favorite: null, note });
+      if (version === noteSaveVersion.current) setMessage("シリーズの備考を保存しました");
+    } catch (error) {
+      if (version === noteSaveVersion.current) setMessage(`備考の保存失敗: ${String(error)}`);
     }
   };
   const tags = parseTags(tagText);
@@ -682,6 +729,7 @@ function SeriesMetadataPanel({ name, books, preferences, onPreferencesUpdated, o
     <label>シリーズの評価スコア<div className="score-editor"><button disabled={busy || !hasBooks} onClick={() => updatePreferences(-1)}>−</button><output>{preferences.score > 0 ? `+${preferences.score}` : preferences.score}</output><button disabled={busy || !hasBooks} onClick={() => updatePreferences(1)}>＋</button></div></label>
     <button className={`favorite-button ${preferences.favorite ? "active" : ""}`} aria-pressed={preferences.favorite} disabled={busy || !hasBooks} onClick={() => updatePreferences(0, !preferences.favorite)}>{preferences.favorite ? "★ シリーズのお気に入り" : "☆ シリーズをお気に入りに追加"}</button>
     <p className="hint">シリーズ自身に保存します。各巻の評価・お気に入りは変更しません。</p>
+    <label>シリーズの備考<textarea rows={3} value={preferences.note} disabled={busy} onChange={(event) => { void saveNote(event.target.value); }} placeholder="どういう話だったか、どこまで読んだかなど" /></label>
     <label>シリーズ名<input value={seriesName} onChange={(event) => setSeriesName(event.target.value)} /></label>
     <button className="secondary centered" disabled={busy || !hasBooks || !trimmedSeriesName || trimmedSeriesName === name} onClick={async () => { await apply({ ...baseInput(), renameTo: trimmedSeriesName, renameFromKey: preferences.key, renameToKey: seriesKey(trimmedSeriesName) }, "シリーズ名を全巻へ適用しました", trimmedSeriesName); }}>シリーズ名を全巻へ適用</button>
     <label>一括タグ<textarea rows={3} value={tagText} onChange={(event) => setTagText(event.target.value)} placeholder="カンマ区切り" /></label>

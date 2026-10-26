@@ -138,10 +138,12 @@ export interface SeriesPreferences {
   key: string;
   score: number;
   favorite: boolean;
+  note: string;
 }
 
 export interface SeriesPreferencesInput {
   key: string;
   scoreDelta: number;
   favorite: boolean | null;
+  note: string | null;
 }
