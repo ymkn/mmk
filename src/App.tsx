@@ -7,9 +7,11 @@ import { BackupDialog } from "./BackupDialog";
 import { BackupSettingsSection } from "./BackupSettings";
 import { CardMetadata } from "./CardMetadata";
 import { readCaptureRoot, writeCaptureRoot } from "./captureSettings";
-import { booksInLibraryView, groupBooks, matchesNoteFilter, matchesRatingFilters, seriesKey, type NoteFilter, type ScoreFilter, type SeriesShelf } from "./domain";
+import { booksInLibraryView, filterLibraryBooks, groupBooks, matchesNoteFilter, matchesRatingFilters, seriesKey, type LibraryTypeFilter, type NoteFilter, type ScoreFilter, type SeriesShelf } from "./domain";
 import { readFilterSections, readLibraryFilters, writeFilterSections, writeLibraryFilters, type FilterSections } from "./filterSettings";
-import type { AmazonContinueSeriesItem, Book, KindleOpenKind, KindleReaderMode, MetadataInput, SeriesMetadataInput, SeriesMode, SeriesPreferences, SeriesPreferencesInput, SyncResult } from "./types";
+import type { AmazonCheckStatus, AmazonContinueSeriesItem, Book, KindleOpenKind, KindleReaderMode, MetadataInput, SeriesMetadataInput, SeriesMode, SeriesPreferences, SeriesPreferencesInput, SyncResult } from "./types";
+import { NewReleaseStatus } from "./NewReleaseStatus";
+import { newReleaseStatusView } from "./amazonCheckView";
 
 type LibraryView = "library" | "new-releases";
 
@@ -250,8 +252,13 @@ function App() {
   const [seriesPreferences, setSeriesPreferences] = useState<SeriesPreferences[]>([]);
   const [seriesNoteDrafts, setSeriesNoteDrafts] = useState<Map<string, { note: string }>>(new Map());
   const [amazonItems, setAmazonItems] = useState<AmazonContinueSeriesItem[]>([]);
+  const [amazonCheckStatus, setAmazonCheckStatus] = useState<AmazonCheckStatus | null>(null);
+  const [amazonCheckError, setAmazonCheckError] = useState("");
+  const [amazonStarting, setAmazonStarting] = useState(false);
+  const amazonStatusVersionRef = useRef(-1);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [initialFilters] = useState(() => readLibraryFilters());
+  const [typeFilter, setTypeFilter] = useState<LibraryTypeFilter>(initialFilters.typeFilter);
   const [query, setQuery] = useState(initialFilters.query);
   const [favoriteOnly, setFavoriteOnly] = useState(initialFilters.favoriteOnly);
   const [scoreFilter, setScoreFilter] = useState<ScoreFilter>(initialFilters.scoreFilter);
@@ -281,17 +288,15 @@ function App() {
   useEffect(() => { writeCaptureRoot(captureRoot); }, [captureRoot]);
   useEffect(() => { writeFilterSections(filterSections); }, [filterSections]);
   useEffect(() => {
-    writeLibraryFilters({ query, favoriteOnly, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags });
-  }, [query, favoriteOnly, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
+    writeLibraryFilters({ typeFilter, query, favoriteOnly, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags });
+  }, [typeFilter, query, favoriteOnly, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
 
   const reload = async () => {
-    const [result, recommendations, preferences] = await Promise.all([
+    const [result, preferences] = await Promise.all([
       api.listBooks(),
-      api.listAmazonContinueSeries(),
       api.listSeriesPreferences(),
     ]);
     setBooks(result);
-    setAmazonItems(recommendations);
     setSeriesPreferences(preferences);
     setUiHydrated(true);
     if (result.length) setStatus(`${result.length.toLocaleString()} 冊`);
@@ -309,19 +314,27 @@ function App() {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    listen<number>("amazon-continue-series-updated", async ({ payload }) => {
+    const refresh = async () => {
       try {
-        const recommendations = await api.listAmazonContinueSeries();
-        if (disposed) return;
-        setAmazonItems(recommendations);
-        setStatus(`Amazonから候補を取得しました（${payload.toLocaleString()}件）`);
+        const snapshot = await api.getAmazonCheckStatus();
+        if (disposed || snapshot.status.version < amazonStatusVersionRef.current) return;
+        amazonStatusVersionRef.current = snapshot.status.version;
+        setAmazonItems(snapshot.items);
+        setAmazonCheckStatus(snapshot.status);
+        setAmazonCheckError("");
       } catch (error) {
-        if (!disposed) setStatus(`Amazon候補の読み込みに失敗: ${String(error)}`);
+        if (!disposed) setAmazonCheckError(`取得状態・候補の読み込みに失敗: ${String(error)}`);
       }
-    }).then((remove) => {
+    };
+    listen<AmazonCheckStatus>("amazon-check-status", refresh).then((remove) => {
       if (disposed) remove();
-      else unlisten = remove;
-    }).catch((error) => setStatus(`Amazon連携の準備に失敗: ${String(error)}`));
+      else {
+        unlisten = remove;
+        void refresh();
+      }
+    }).catch((error) => {
+      if (!disposed) setAmazonCheckError(`Amazon連携の準備に失敗: ${String(error)}`);
+    });
     return () => {
       disposed = true;
       unlisten?.();
@@ -410,7 +423,7 @@ function App() {
     return result;
   }, [seriesPreferences, seriesNoteDrafts]);
 
-  const filtered = useMemo(() => {
+  const matchingBooks = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase("ja");
     return books.filter((book) => {
       if (book.sourceStatus !== "active") return false;
@@ -427,6 +440,7 @@ function App() {
     });
   }, [books, preferencesByKey, favoriteOnly, query, scoreFilter, noteFilter, selectedAuthors, selectedPublishers, selectedLabels, selectedTags]);
 
+  const filtered = useMemo(() => filterLibraryBooks(matchingBooks, typeFilter), [matchingBooks, typeFilter]);
   const shelves = useMemo(() => groupBooks(filtered), [filtered]);
   const newReleaseSeries = useMemo<NewReleaseSeries[]>(() => {
     const owned = books.filter((book) => book.sourceStatus === "active" && book.effectiveSeriesName);
@@ -481,12 +495,20 @@ function App() {
   };
 
   const openAmazonChecker = async () => {
-    setActiveView("new-releases");
+    setAmazonStarting(true);
+    setAmazonCheckError("");
     try {
       await api.openAmazonContinueSeries();
-      setStatus("Amazonの新刊情報を確認しています。ログインが必要な場合だけ画面を表示します");
+      const snapshot = await api.getAmazonCheckStatus();
+      if (snapshot.status.version >= amazonStatusVersionRef.current) {
+        amazonStatusVersionRef.current = snapshot.status.version;
+        setAmazonCheckStatus(snapshot.status);
+        setAmazonItems(snapshot.items);
+      }
     } catch (error) {
-      setStatus(`Amazon画面を開けませんでした: ${String(error)}`);
+      setAmazonCheckError(`Amazon画面を開けませんでした: ${String(error)}`);
+    } finally {
+      setAmazonStarting(false);
     }
   };
 
@@ -494,9 +516,10 @@ function App() {
     try {
       await api.clearAmazonSession();
       setAmazonItems([]);
+      setAmazonCheckError("");
       setStatus("Amazonの連携データと専用WebViewのログイン状態を削除しました");
     } catch (error) {
-      setStatus(`Amazon連携データを削除できませんでした: ${String(error)}`);
+      setAmazonCheckError(`Amazon連携データを削除できませんでした: ${String(error)}`);
     }
   };
 
@@ -534,8 +557,14 @@ function App() {
     }
   };
 
-  const hasActiveFilters = query.trim() !== "" || favoriteOnly || scoreFilter !== "all" || noteFilter !== "all" || selectedAuthors.size > 0 || selectedPublishers.size > 0 || selectedLabels.size > 0 || selectedTags.size > 0;
+  const changeTypeFilter = (value: LibraryTypeFilter) => {
+    setTypeFilter(value);
+    setOpenedSeries(null);
+    setSelectedId(null);
+  };
+  const hasActiveFilters = typeFilter !== "all" || query.trim() !== "" || favoriteOnly || scoreFilter !== "all" || noteFilter !== "all" || selectedAuthors.size > 0 || selectedPublishers.size > 0 || selectedLabels.size > 0 || selectedTags.size > 0;
   const clearFilters = () => {
+    setTypeFilter("all");
     setQuery("");
     setFavoriteOnly(false);
     setScoreFilter("all");
@@ -552,6 +581,7 @@ function App() {
     setSelectedId(null);
   };
   const activeFilterChips = ([
+    typeFilter !== "all" && { key: "type", label: typeFilter === "books" ? "書籍のみ" : "シリーズのみ" },
     query.trim() && { key: "query", label: `検索: ${query.trim()}` },
     favoriteOnly && { key: "favorite", label: "★ お気に入り" },
     scoreFilter !== "all" && { key: "score", label: scoreFilter === "positive" ? "評価 ＋" : "評価 −" },
@@ -562,6 +592,8 @@ function App() {
     selectedTags.size > 0 && { key: "tags", label: `タグ: ${[...selectedTags].join("、")}` },
   ].filter(Boolean) as { key: string; label: string }[]);
 
+  const amazonView = newReleaseStatusView(amazonCheckStatus, amazonItems.length, amazonCheckError);
+
   return (
     <main className="app-shell">
       <aside className="panel filter-panel">
@@ -571,6 +603,13 @@ function App() {
           <button className="icon-button" onClick={clearFilters} aria-label="選択中のフィルターを解除">×</button>
         </div>}
         <input className="search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="タイトル、著者、タグ、ASIN" />
+        <FilterSection id="type" title="種別" open={filterSections.type} count={Number(typeFilter !== "all")} onToggle={() => toggleFilterSection("type")}>
+          <div className="segmented" role="group" aria-label="書籍・シリーズの種別">
+            <button className={typeFilter === "all" ? "active" : ""} aria-pressed={typeFilter === "all"} onClick={() => changeTypeFilter("all")}>すべて</button>
+            <button className={typeFilter === "books" ? "active" : ""} aria-pressed={typeFilter === "books"} onClick={() => changeTypeFilter("books")}>書籍</button>
+            <button className={typeFilter === "series" ? "active" : ""} aria-pressed={typeFilter === "series"} onClick={() => changeTypeFilter("series")}>シリーズ</button>
+          </div><p className="muted rating-filter-hint">絞り込み後、同じシリーズが2冊以上ならシリーズ、それ以外は書籍として表示します。</p>
+        </FilterSection>
         <FilterSection id="tags" title="タグ" open={filterSections.tags} count={selectedTags.size} onToggle={() => toggleFilterSection("tags")}><div className="tag-cloud">
           {tagCounts.length ? tagCounts.map(([tag, count]) => <button key={tag} className={selectedTags.has(tag) ? "tag active" : "tag"} aria-pressed={selectedTags.has(tag)} onClick={() => toggleFacet(setSelectedTags, tag)}>{tag}<small>{count}</small></button>) : <p className="muted">タグはまだありません</p>}
         </div></FilterSection>
@@ -597,7 +636,7 @@ function App() {
         <header className="library-tab-bar">
           <nav className="library-tabs" role="tablist" aria-label="中央ペインの表示">
             <button id="library-tab" role="tab" aria-selected={activeView === "library"} aria-controls="library-panel" className={activeView === "library" ? "active" : ""} onClick={() => setActiveView("library")}>ライブラリ</button>
-            <button id="new-releases-tab" role="tab" aria-selected={activeView === "new-releases"} aria-controls="new-releases-panel" className={activeView === "new-releases" ? "active" : ""} onClick={openAmazonChecker}>新刊チェック<span className="tab-count">{newReleaseSeries.length}</span></button>
+            <button id="new-releases-tab" role="tab" aria-selected={activeView === "new-releases"} aria-controls="new-releases-panel" className={activeView === "new-releases" ? "active" : ""} onClick={() => setActiveView("new-releases")}>新刊チェック<span className="tab-count">{newReleaseSeries.length}</span></button>
           </nav>
           <div className="library-actions" role="group" aria-label="ライブラリの操作">
             <button className="primary" disabled={busy} onClick={sync}>{busy ? "同期中…" : "Kindleと同期"}</button>
@@ -612,10 +651,12 @@ function App() {
             </div>
           </div>
           {activeView === "library" && <button className="secondary toolbar-button" onClick={() => setBatchCaptureOpen(true)}>一括バックアップ…</button>}
+          {activeView === "new-releases" && <button className="primary toolbar-button" disabled={amazonStarting || amazonView.checking} onClick={openAmazonChecker}>{amazonStarting || amazonView.checking ? "取得中…" : amazonView.loginRequired ? "ログイン画面を表示" : "再チェック"}</button>}
         </div>
         <div className="library-scroll">
           {activeView === "new-releases" ? <section id="new-releases-panel" role="tabpanel" aria-labelledby="new-releases-tab" className="new-release-section">
             <div className="section-heading"><h2 className="section-title">新刊チェック</h2><span className="muted">{newReleaseSeries.length}シリーズ</span></div>
+            <NewReleaseStatus status={amazonCheckStatus} savedCount={amazonItems.length} displayedCount={newReleaseSeries.length} excludePreRelease={excludePreReleaseNewReleases} error={amazonCheckError} />
             {newReleaseSeries.length > 0 ? <div className="new-release-list">
               {newReleaseSeries.map((series) => <article className="new-release-card" key={series.key}>
                 <div className="new-release-main">
@@ -624,14 +665,14 @@ function App() {
                 </div>
                 <button className="secondary new-release-button" onClick={() => api.openStorePage(series.recommendation.asin)}>Amazonで確認 ↗</button>
               </article>)}
-            </div> : <div className="empty-state new-release-empty"><strong>続刊候補はありません</strong><span>「新刊チェック」を実行すると、Amazonの推薦と手元の巻数を照合します。</span></div>}
-            <div className="new-release-footer"><span className="hint">Amazonの推薦と手元の巻数を照合した候補です。未購入の確定情報ではありません。</span><button className="library-link" onClick={clearAmazonSession}>Amazon連携を解除</button></div>
+            </div> : <div className="empty-state new-release-empty"><strong>{amazonView.emptyTitle}</strong><span>{amazonView.emptyDetail}</span></div>}
+            <div className="new-release-footer"><span className="hint">Amazonの推薦ページ1と手元の巻数を照合した候補です。すべての新刊を確認する機能ではありません。</span><button className="library-link" disabled={amazonStarting || amazonView.checking || amazonView.loginRequired} onClick={clearAmazonSession}>Amazon連携を解除</button></div>
           </section> : <div id="library-panel" role="tabpanel" aria-labelledby="library-tab">
             {!openedSeries && shelves.series.length > 0 && <><h2 className="section-title">シリーズ</h2><div className="book-grid">
               {shelves.series.map((series) => <SeriesCard key={series.key} series={series} preferences={preferencesByKey.get(series.key)} onSelect={() => { setOpenedSeries(series.key); setSelectedId(null); }} />)}
             </div></>}
-            <h2 className="section-title">{openedSeries ? "巻一覧" : "書籍"}</h2>
-            <div className="book-grid">{visibleBooks.map((book) => <BookCard key={book.id} book={book} selected={book.id === selectedId} onSelect={() => setSelectedId(book.id)} onOpenKindle={openKindle} />)}</div>
+            {(openedSeries || typeFilter !== "series") && <><h2 className="section-title">{openedSeries ? "巻一覧" : "書籍"}</h2>
+            <div className="book-grid">{visibleBooks.map((book) => <BookCard key={book.id} book={book} selected={book.id === selectedId} onSelect={() => setSelectedId(book.id)} onOpenKindle={openKindle} />)}</div></>}
             {!visibleBooks.length && (!shelves.series.length || openedSeries) && <div className="empty-state"><strong>表示する本がありません</strong><span>同期またはフィルター条件を確認してください。</span></div>}
           </div>}
         </div>

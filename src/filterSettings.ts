@@ -1,9 +1,10 @@
-import type { NoteFilter, ScoreFilter } from "./domain";
+import type { LibraryTypeFilter, NoteFilter, ScoreFilter } from "./domain";
 
 export const FILTER_SECTIONS_STORAGE_KEY = "mmk.filter-sections.v1";
 export const LIBRARY_FILTERS_STORAGE_KEY = "mmk.library-filters.v1";
 
 export const DEFAULT_FILTER_SECTIONS = {
+  type: true,
   tags: true,
   rating: false,
   notes: false,
@@ -16,6 +17,7 @@ export type FilterSections = typeof DEFAULT_FILTER_SECTIONS;
 type StorageAccess = Pick<Storage, "getItem" | "setItem">;
 
 export interface LibraryFilters {
+  typeFilter: LibraryTypeFilter;
   query: string;
   favoriteOnly: boolean;
   scoreFilter: ScoreFilter;
@@ -28,6 +30,7 @@ export interface LibraryFilters {
 
 export function readLibraryFilters(storage?: StorageAccess): LibraryFilters {
   const result: LibraryFilters = {
+    typeFilter: "all",
     query: "",
     favoriteOnly: false,
     scoreFilter: "all",
@@ -40,6 +43,7 @@ export function readLibraryFilters(storage?: StorageAccess): LibraryFilters {
   try {
     const parsed = JSON.parse((storage ?? localStorage).getItem(LIBRARY_FILTERS_STORAGE_KEY) ?? "null");
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (["all", "books", "series"].includes(parsed.typeFilter)) result.typeFilter = parsed.typeFilter;
       if (typeof parsed.query === "string") result.query = parsed.query;
       if (typeof parsed.favoriteOnly === "boolean") result.favoriteOnly = parsed.favoriteOnly;
       if (["all", "positive", "negative"].includes(parsed.scoreFilter)) result.scoreFilter = parsed.scoreFilter;
@@ -59,6 +63,7 @@ export function readLibraryFilters(storage?: StorageAccess): LibraryFilters {
 export function writeLibraryFilters(filters: LibraryFilters, storage?: StorageAccess): void {
   try {
     (storage ?? localStorage).setItem(LIBRARY_FILTERS_STORAGE_KEY, JSON.stringify({
+      typeFilter: filters.typeFilter,
       query: filters.query,
       favoriteOnly: filters.favoriteOnly,
       scoreFilter: filters.scoreFilter,

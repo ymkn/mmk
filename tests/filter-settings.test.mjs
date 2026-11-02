@@ -12,13 +12,13 @@ function storage(raw = null) {
   return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) };
 }
 
-test('tags are expanded by default and less-used sections are collapsed', () => {
-  assert.deepEqual(readFilterSections(storage()), { tags: true, rating: false, notes: false, authors: false, publishers: false, labels: false });
+test('type and tags are expanded by default and less-used sections are collapsed', () => {
+  assert.deepEqual(readFilterSections(storage()), { type: true, tags: true, rating: false, notes: false, authors: false, publishers: false, labels: false });
 });
 
 test('every section restores its independently saved open or closed state', () => {
   const s = storage();
-  const sections = { tags: false, rating: true, notes: true, authors: true, publishers: false, labels: true };
+  const sections = { type: false, tags: false, rating: true, notes: true, authors: true, publishers: false, labels: true };
   writeFilterSections(sections, s);
   assert.deepEqual(readFilterSections(s), sections);
   writeFilterSections(DEFAULT_FILTER_SECTIONS, s);
@@ -41,6 +41,7 @@ test('inaccessible storage does not prevent the library from opening', () => {
 test('all filter conditions survive saving and reopening, including multiple facets', () => {
   const s = storage();
   const filters = {
+    typeFilter: 'series',
     query: ' 星巡り ASIN ',
     favoriteOnly: true,
     scoreFilter: 'negative',
@@ -50,11 +51,13 @@ test('all filter conditions survive saving and reopening, including multiple fac
     selectedLabels: new Set(['レーベルA', 'レーベルB']),
     selectedTags: new Set(['読了', '続刊待ち']),
   };
-  for (const scoreFilter of ['all', 'positive', 'negative']) {
-    for (const noteFilter of ['all', 'with-note', 'without-note']) {
-      const selection = { ...filters, scoreFilter, noteFilter };
-      writeLibraryFilters(selection, s);
-      assert.deepEqual(readLibraryFilters(s), selection);
+  for (const typeFilter of ['all', 'books', 'series']) {
+    for (const scoreFilter of ['all', 'positive', 'negative']) {
+      for (const noteFilter of ['all', 'with-note', 'without-note']) {
+        const selection = { ...filters, typeFilter, scoreFilter, noteFilter };
+        writeLibraryFilters(selection, s);
+        assert.deepEqual(readLibraryFilters(s), selection);
+      }
     }
   }
 });
@@ -63,7 +66,7 @@ test('latest filter selection replaces the previous one and clearing survives re
   const s = storage();
   const defaults = readLibraryFilters(s);
   writeLibraryFilters({ ...defaults, query: '最初', favoriteOnly: true, selectedTags: new Set(['読了']) }, s);
-  const latest = { ...defaults, query: '最後', noteFilter: 'without-note', selectedAuthors: new Set(['著者']) };
+  const latest = { ...defaults, typeFilter: 'books', query: '最後', noteFilter: 'without-note', selectedAuthors: new Set(['著者']) };
   writeLibraryFilters(latest, s);
   assert.deepEqual(readLibraryFilters(s), latest);
   writeLibraryFilters(defaults, s);
@@ -73,6 +76,7 @@ test('latest filter selection replaces the previous one and clearing survives re
 test('filter selections validate each property and discard malformed facet values', () => {
   const s = storage();
   s.setItem(FILTERS_KEY, JSON.stringify({
+    typeFilter: 'invalid',
     query: 42,
     favoriteOnly: 'false',
     scoreFilter: 'unsupported',
@@ -93,6 +97,7 @@ test('filter selections validate each property and discard malformed facet value
 test('missing filter fields default safely and section state stays independent', () => {
   const s = storage();
   const defaults = readLibraryFilters(s);
+  assert.equal(defaults.typeFilter, 'all');
   s.setItem(FILTERS_KEY, JSON.stringify({ query: '検索', noteFilter: 'with-note' }));
   const filters = { ...defaults, query: '検索', noteFilter: 'with-note' };
   assert.deepEqual(readLibraryFilters(s), filters);

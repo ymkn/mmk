@@ -115,6 +115,14 @@ pub struct AmazonContinueSeriesItemInput {
     pub image_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmazonCheckResult {
+    pub completed_at: String,
+    pub received_count: usize,
+    pub stored_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AmazonContinueSeriesItemView {
