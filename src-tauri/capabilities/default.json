@@ -19,6 +19,7 @@
     "allow-open-kofi-donation",
     "allow-open-amazon-continue-series",
     "allow-list-amazon-continue-series",
+    "allow-get-amazon-check-status",
     "allow-clear-amazon-session",
     "allow-list-capture-windows",
     "allow-open-capture-reader",

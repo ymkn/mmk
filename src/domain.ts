@@ -2,6 +2,7 @@ import type { Book, SeriesPreferences } from "./types";
 
 export type ScoreFilter = "all" | "positive" | "negative";
 export type NoteFilter = "all" | "with-note" | "without-note";
+export type LibraryTypeFilter = "all" | "books" | "series";
 
 export function matchesNoteFilter(preferences: SeriesPreferences | undefined, filter: NoteFilter): boolean {
   const hasNote = Boolean(preferences?.note?.trim());
@@ -38,6 +39,14 @@ export function booksInLibraryView(filtered: Book[], openedSeries: string | null
   return openedSeries
     ? filtered.filter((book) => book.effectiveSeriesName && seriesKey(book.effectiveSeriesName) === openedSeries)
     : filtered;
+}
+
+// Match the cards produced after the other filters, including single-volume series shown as books.
+export function filterLibraryBooks(books: Book[], filter: LibraryTypeFilter): Book[] {
+  if (filter === "all") return books;
+  const shelves = groupBooks(books);
+  const included = new Set(filter === "books" ? shelves.singles : shelves.series.flatMap((series) => series.books));
+  return books.filter((book) => included.has(book));
 }
 
 export function groupBooks(books: Book[]): LibraryShelves {

@@ -47,6 +47,9 @@ h1, h2, h3, p { margin-top: 0; } h1 { font-size: 22px; margin-bottom: 2px; } h2 
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .section-heading .section-title { margin-bottom: 8px; }
 .new-release-list { display: grid; gap: 8px; }
+.new-release-status { display: grid; gap: 6px; margin: 4px 0 12px; padding: 12px; border: 1px solid #d9d2c8; border-radius: 8px; background: #fffaf2; font-size: 12px; overflow-wrap: anywhere; }
+.new-release-status strong { font-size: 14px; }.new-release-status.is-error { border-color: #c98e81; background: #fff2ee; }.new-release-status.is-error strong { color: #a22d22; }
+.new-release-empty span { max-width: 420px; line-height: 1.7; }.new-release-footer .library-link:disabled { opacity: .5; cursor: default; }
 .new-release-card { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 12px; border: 1px solid #ded5c8; border-radius: 8px; background: #fffaf2; }
 .new-release-main { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 12px; }
 .new-release-cover { flex: 0 0 auto; width: 52px; height: 78px; object-fit: cover; border-radius: 4px; background: #ddd5ca; box-shadow: 0 2px 7px rgba(49,37,25,.16); }

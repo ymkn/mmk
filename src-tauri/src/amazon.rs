@@ -23,15 +23,15 @@ pub const AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT: &str = r#"
   if (window.location.hostname !== 'www.amazon.co.jp') return;
 
   const maxItems = 500;
+  const checkId = __MMK_CHECK_ID__;
   const invoke = (command, args = {}) => {
     const bridge = window.__TAURI_INTERNALS__;
-    if (!bridge || typeof bridge.invoke !== 'function') return false;
-    bridge.invoke(command, args).catch(() => {});
-    return true;
+    if (!bridge || typeof bridge.invoke !== 'function') return Promise.reject(new Error('Tauri bridge unavailable'));
+    return bridge.invoke(command, { ...args, checkId });
   };
 
   if (window.location.pathname.startsWith('/ap/signin')) {
-    const showLogin = () => invoke('show_amazon_login');
+    const showLogin = () => invoke('show_amazon_login').catch(() => {});
     if (document.readyState === 'loading') {
       window.addEventListener('DOMContentLoaded', showLogin, { once: true });
     } else {
@@ -82,19 +82,42 @@ pub const AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT: &str = r#"
     return parsePrice(value.altText || value.displayString || '');
   };
 
-  const ratingKeys = new Set(['rating', 'ratingValue', 'starRating', 'reviewRating', 'averageRating', 'customerRating']);
+  // seeMore cards use averageRatingValue / reviewInfo.reviewStarInfo, while
+  // storefront cards use starCountAlt etc. Neither format uses "rating" alone.
+  const ratingKeys = new Set([
+    'rating', 'ratingValue', 'starRating', 'reviewRating', 'averageRating', 'customerRating',
+    'averageRatingValue', 'reviewStarInfo', 'starCountAlt', 'starCountShortDisplayString', 'fullStarCount',
+  ]);
+  const reviewCountKeys = new Set(['reviewCount', 'numberReviews', 'ratingCount']);
   const containsRatingValue = (value, depth = 0) => {
     if (depth > 3 || value == null) return false;
-    if (typeof value === 'number') return Number.isFinite(value);
-    if (typeof value === 'string') return value.trim() !== '';
+    if (typeof value === 'number') return Number.isFinite(value) && value > 0 && value <= 5;
+    if (typeof value === 'string') {
+      const text = value.normalize('NFKC').trim();
+      if (/^\d+(?:\.\d+)?$/.test(text)) return containsRatingValue(Number(text));
+      const match = text.match(/(?:5つ星のうち|5つのうち)\s*(\d+(?:\.\d+)?)/)
+        || text.match(/(\d+(?:\.\d+)?)\s*(?:out of\s*5|\/\s*5)/i);
+      return Boolean(match && containsRatingValue(Number(match[1])));
+    }
     if (typeof value !== 'object') return false;
-    return Object.values(value).some((child) => containsRatingValue(child, depth + 1));
+    // Do not mistake maxValue=5, a review URL or a placeholder label for a rating.
+    return ['value', 'ratingValue', 'averageRatingValue', 'alt', 'altText', 'displayString', 'shortDisplayString', 'numberOfFilledStar']
+      .some((key) => containsRatingValue(value[key], depth + 1));
+  };
+  const containsReviewCount = (value) => {
+    if (typeof value === 'string') {
+      const text = value.normalize('NFKC').trim();
+      if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(text)) return false;
+      value = Number(text.replace(/,/g, ''));
+    }
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
   };
 
   const cardHasRating = (card) => {
     const visit = (value, key, depth) => {
       if (depth > 5 || value == null) return false;
       if (ratingKeys.has(key) && containsRatingValue(value)) return true;
+      if (reviewCountKeys.has(key) && containsReviewCount(value)) return true;
       if (typeof value !== 'object') return false;
       return Object.entries(value).some(([childKey, child]) => visit(child, childKey, depth + 1));
     };
@@ -160,19 +183,36 @@ pub const AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT: &str = r#"
     return true;
   };
 
-  const collect = () => {
-    if (loginRequired()) return navigateToLogin();
-    for (const script of Array.from(document.scripts)) {
-      const text = script.textContent || '';
-      if (!text.includes('CBBE_BooksCardsReactAssets_cardsToRender')) continue;
-      const marker = text.indexOf('asinList');
-      if (marker < 0) continue;
-      const start = text.indexOf('[', marker);
-      if (start < 0) continue;
-      const json = balancedJson(text, start, '[', ']');
-      if (!json) continue;
-      try {
-        const cards = JSON.parse(json);
+  const collect = async () => {
+    if (done || collecting) return;
+    collecting = true;
+    try {
+      if (document.querySelector('#captchacharacters, form[action*="validateCaptcha"]') || window.location.pathname.includes('validateCaptcha')) {
+        done = true;
+        await invoke('report_amazon_check_error', { reason: 'verification' });
+        return;
+      }
+      if (loginRequired()) {
+        done = navigateToLogin();
+        return;
+      }
+      for (const script of Array.from(document.scripts)) {
+        const text = script.textContent || '';
+        if (!text.includes('CBBE_BooksCardsReactAssets_cardsToRender')) continue;
+        const marker = text.indexOf('asinList');
+        if (marker < 0) continue;
+        const start = text.indexOf('[', marker);
+        if (start < 0) continue;
+        const json = balancedJson(text, start, '[', ']');
+        if (!json) continue;
+        let cards;
+        try {
+          cards = JSON.parse(json);
+        } catch (_) {
+          // Amazon may replace the card payload while the page is rendering.
+          continue;
+        }
+        if (!Array.isArray(cards)) continue;
         const items = cards.slice(0, maxItems).map((card) => ({
           asin: String(card.asin || ''),
           title: String(card.bookTitle || ''),
@@ -180,17 +220,29 @@ pub const AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT: &str = r#"
           hasRating: cardHasRating(card),
           imageUrl: parseImageUrl(card),
         })).filter((item) => item.asin && item.title);
-        return send(items);
-      } catch (_) {
-        // Amazon may replace the card payload while the page is rendering.
+        await send(items);
+        done = true;
+        return;
       }
+    } catch (_) {
+      done = true;
+      await invoke('report_amazon_check_error', { reason: 'bridge' }).catch(() => {});
+    } finally {
+      collecting = false;
+      if (done) window.clearInterval(timer);
     }
-    return false;
   };
 
   let attempts = 0;
+  let done = false;
+  let collecting = false;
   const timer = window.setInterval(() => {
-    if (collect() || ++attempts >= 120) window.clearInterval(timer);
+    collect();
+    if (++attempts >= 120 && !done && !collecting) {
+      done = true;
+      window.clearInterval(timer);
+      invoke('report_amazon_check_error', { reason: 'unreadable' }).catch(() => {});
+    }
   }, 500);
   window.addEventListener('load', collect, { once: true });
 })();

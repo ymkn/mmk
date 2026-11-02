@@ -141,6 +141,18 @@ export interface SeriesPreferences {
   note: string;
 }
 
+export interface AmazonCheckStatus {
+  version: number;
+  phase: "idle" | "checking" | "login-required" | "success" | "error";
+  message: string;
+  lastSuccess: { completedAt: string; receivedCount: number; storedCount: number } | null;
+}
+
+export interface AmazonCheckSnapshot {
+  status: AmazonCheckStatus;
+  items: AmazonContinueSeriesItem[];
+}
+
 export interface SeriesPreferencesInput {
   key: string;
   scoreDelta: number;

@@ -1,4 +1,5 @@
 mod amazon;
+mod amazon_check;
 mod backup_settings;
 mod capture;
 mod capture_layout;
@@ -15,7 +16,7 @@ use models::{
     AmazonContinueSeriesItemInput, AmazonContinueSeriesItemView, BookMetadataInput, BookView,
     SeriesMetadataInput, SeriesPreferences, SeriesPreferencesInput, SyncResult,
 };
-use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
@@ -170,29 +171,114 @@ async fn open_amazon_continue_series(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     require_main(&window)?;
-    if let Some(existing) = app.get_webview_window(amazon::AMAZON_CONTINUE_SERIES_LABEL) {
-        existing.reload().map_err(|error| error.to_string())?;
-        return Ok(());
+    let state = app.state::<amazon_check::ManagerState>();
+    if state.snapshot().phase == amazon_check::Phase::LoginRequired {
+        if let Some(existing) = app.get_webview_window(amazon::AMAZON_CONTINUE_SERIES_LABEL) {
+            existing.show().map_err(|error| error.to_string())?;
+            return existing.set_focus().map_err(|error| error.to_string());
+        }
     }
+    let (check_id, status) = state.start()?;
+    amazon_check::publish(&app, status);
+    let result = build_amazon_checker(&app, check_id);
+    if let Err(error) = &result {
+        amazon_check::fail(
+            &app,
+            check_id,
+            &format!("Amazon画面を開けませんでした: {error}"),
+        );
+    } else {
+        amazon_check::watch(app.clone(), check_id);
+    }
+    result
+}
 
+fn build_amazon_checker(app: &tauri::AppHandle, check_id: u64) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(amazon::AMAZON_CONTINUE_SERIES_LABEL) {
+        existing.close().map_err(|error| error.to_string())?;
+    }
     let data_directory = amazon_data_directory(&app)?;
     let url =
         tauri::Url::parse(&amazon::continue_series_url()).map_err(|error| error.to_string())?;
     let mut builder = WebviewWindowBuilder::new(
-        &app,
+        app,
         amazon::AMAZON_CONTINUE_SERIES_LABEL,
         WebviewUrl::External(url),
     )
     .title("Amazon 新刊チェック")
     .inner_size(1200.0, 800.0)
     .data_directory(data_directory)
-    .initialization_script(amazon::AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT)
+    .initialization_script(
+        amazon::AMAZON_CONTINUE_SERIES_IMPORT_SCRIPT
+            .replace("__MMK_CHECK_ID__", &check_id.to_string()),
+    )
+    .on_page_load(move |window, payload| {
+        use tauri::webview::PageLoadEvent;
+        let app = window.app_handle();
+        if payload.event() == PageLoadEvent::Started {
+            if let Some(status) = app.state::<amazon_check::ManagerState>().update(
+                check_id,
+                amazon_check::Phase::Checking,
+                "Amazonのページを読み込んでいます",
+            ) {
+                amazon_check::publish(app, status);
+            }
+            return;
+        }
+        let (phase, message) = if amazon::is_sign_in_url(payload.url()) {
+            (
+                amazon_check::Phase::LoginRequired,
+                "Amazonへのログインが必要です。専用画面でログインしてください",
+            )
+        } else {
+            (
+                amazon_check::Phase::Checking,
+                "Amazonのページから候補を読み取っています",
+            )
+        };
+        if let Some(status) = app
+            .state::<amazon_check::ManagerState>()
+            .update(check_id, phase, message)
+        {
+            if phase == amazon_check::Phase::LoginRequired {
+                if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+                    amazon_check::fail(
+                        app,
+                        check_id,
+                        &format!("ログイン画面を表示できませんでした: {error}"),
+                    );
+                    return;
+                }
+            }
+            amazon_check::publish(app, status);
+        }
+    })
     .visible(false);
     if let Some(main) = app.get_webview_window("main") {
         builder = builder.parent(&main).map_err(|error| error.to_string())?;
     }
-    builder.build().map_err(|error| error.to_string())?;
+    let window = builder.build().map_err(|error| error.to_string())?;
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            amazon_check::fail(
+                &handle,
+                check_id,
+                "新刊チェックが完了する前にAmazon画面が閉じられました。再チェックしてください",
+            );
+        }
+    });
     Ok(())
+}
+
+#[tauri::command]
+fn get_amazon_check_status(
+    window: WebviewWindow,
+    state: State<'_, amazon_check::ManagerState>,
+    database: State<'_, Database>,
+) -> Result<amazon_check::Snapshot, String> {
+    require_main(&window)?;
+    state.snapshot_with_items(&database)
 }
 
 #[tauri::command]
@@ -205,12 +291,22 @@ fn list_amazon_continue_series(
 }
 
 #[tauri::command]
-fn show_amazon_login(window: WebviewWindow) -> Result<(), String> {
+fn show_amazon_login(window: WebviewWindow, check_id: u64) -> Result<(), String> {
     require_amazon_window(&window)?;
     let url = window.url().map_err(|error| error.to_string())?;
     if !amazon::is_sign_in_url(&url) {
         return Err("Amazonログイン画面以外からの表示要求を拒否しました".to_owned());
     }
+    let app = window.app_handle();
+    let status = app
+        .state::<amazon_check::ManagerState>()
+        .update(
+            check_id,
+            amazon_check::Phase::LoginRequired,
+            "Amazonへのログインが必要です。専用画面でログインしてください",
+        )
+        .ok_or("終了済みの新刊チェックです")?;
+    amazon_check::publish(app, status);
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
 }
@@ -220,14 +316,45 @@ fn store_amazon_continue_series(
     window: WebviewWindow,
     app: tauri::AppHandle,
     database: State<'_, Database>,
+    check_id: u64,
     items: Vec<AmazonContinueSeriesItemInput>,
-) -> Result<usize, String> {
+) -> Result<(), String> {
     require_amazon_window(&window)?;
-    let stored = database.replace_amazon_continue_series(items)?;
-    app.emit("amazon-continue-series-updated", stored)
-        .map_err(|error| error.to_string())?;
-    window.close().map_err(|error| error.to_string())?;
-    Ok(stored)
+    let result = app
+        .state::<amazon_check::ManagerState>()
+        .complete(check_id, &database, items);
+    match result {
+        Ok(status) => {
+            let _ = window.close();
+            amazon_check::publish(&app, status);
+            Ok(())
+        }
+        Err(error) => {
+            amazon_check::fail(
+                &app,
+                check_id,
+                &format!("取得結果を保存できませんでした: {error}"),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+fn report_amazon_check_error(
+    window: WebviewWindow,
+    check_id: u64,
+    reason: String,
+) -> Result<(), String> {
+    require_amazon_window(&window)?;
+    let message = match reason.as_str() {
+        "verification" => "Amazonで追加認証またはアクセス確認が求められています。再チェックしても続く場合は時間を置いてください",
+        "bridge" => "Amazonの取得結果を受け取れませんでした。再チェックしてください",
+        _ => "Amazonページから候補を読み取れませんでした。通信・ログイン状態、またはAmazon側のページ変更が原因の可能性があります",
+    };
+    amazon_check::fail(window.app_handle(), check_id, message);
+    let _ = window.close();
+    Ok(())
 }
 
 #[tauri::command]
@@ -259,7 +386,10 @@ fn clear_amazon_session(
             .map_err(|error| error.to_string())?;
         clear_window.close().map_err(|error| error.to_string())?;
     }
-    database.clear_amazon_continue_series()
+    database.clear_amazon_continue_series()?;
+    let status = app.state::<amazon_check::ManagerState>().clear();
+    amazon_check::publish(&app, status);
+    Ok(())
 }
 
 fn amazon_data_directory(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -803,6 +933,10 @@ pub fn run() {
             let database_dir = app.path().app_data_dir()?;
             let database_path = database_dir.join("mmk.sqlite3");
             let database = Database::initialize(database_path).map_err(std::io::Error::other)?;
+            let last_result = database
+                .last_amazon_check_result()
+                .map_err(std::io::Error::other)?;
+            app.manage(amazon_check::ManagerState::new(last_result));
             app.manage(database);
             app.state::<capture::CaptureManager>()
                 .configure_logging(database_dir.join("logs").join("backup"));
@@ -823,7 +957,9 @@ pub fn run() {
             open_kofi_donation,
             open_amazon_continue_series,
             list_amazon_continue_series,
+            get_amazon_check_status,
             show_amazon_login,
+            report_amazon_check_error,
             store_amazon_continue_series,
             clear_amazon_session,
             list_capture_windows,

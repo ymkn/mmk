@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-report-amazon-check-error"
+description = "Enables the report_amazon_check_error command without any pre-configured scope."
+commands.allow = ["report_amazon_check_error"]
+
+[[permission]]
+identifier = "deny-report-amazon-check-error"
+description = "Denies the report_amazon_check_error command without any pre-configured scope."
+commands.deny = ["report_amazon_check_error"]

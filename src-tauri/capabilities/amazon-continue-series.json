@@ -9,6 +9,7 @@
   },
   "permissions": [
     "allow-show-amazon-login",
+    "allow-report-amazon-check-error",
     "allow-store-amazon-continue-series"
   ]
 }

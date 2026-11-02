@@ -3,11 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::models::{
-    AmazonContinueSeriesItemInput, AmazonContinueSeriesItemView, BookMetadataInput, BookView,
-    ImportedBook, SeriesMetadataInput, SeriesPreferences, SeriesPreferencesInput, SyncResult,
+    AmazonCheckResult, AmazonContinueSeriesItemInput, AmazonContinueSeriesItemView,
+    BookMetadataInput, BookView, ImportedBook, SeriesMetadataInput, SeriesPreferences,
+    SeriesPreferencesInput, SyncResult,
 };
 use crate::series;
 
@@ -400,7 +401,7 @@ impl Database {
     pub fn replace_amazon_continue_series(
         &self,
         items: Vec<AmazonContinueSeriesItemInput>,
-    ) -> Result<usize, String> {
+    ) -> Result<AmazonCheckResult, String> {
         if items.len() > 500 {
             return Err("Amazonの候補数が多すぎます".to_owned());
         }
@@ -414,6 +415,7 @@ impl Database {
             .execute("DELETE FROM amazon_continue_series_items", [])
             .map_err(|error| error.to_string())?;
 
+        let received_count = items.len();
         let mut stored = 0;
         let mut seen_asins = HashSet::new();
         for item in items {
@@ -449,8 +451,28 @@ impl Database {
             stored += 1;
         }
 
+        transaction.execute(
+            "INSERT INTO amazon_check_result (id, completed_at, received_count, stored_count) VALUES (1, ?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET completed_at=excluded.completed_at, received_count=excluded.received_count, stored_count=excluded.stored_count",
+            params![now, received_count as i64, stored as i64],
+        ).map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(stored)
+        Ok(AmazonCheckResult {
+            completed_at: now,
+            received_count,
+            stored_count: stored,
+        })
+    }
+
+    pub fn last_amazon_check_result(&self) -> Result<Option<AmazonCheckResult>, String> {
+        self.connect()?.query_row(
+            "SELECT completed_at, received_count, stored_count FROM amazon_check_result WHERE id=1",
+            [],
+            |row| Ok(AmazonCheckResult {
+                completed_at: row.get(0)?,
+                received_count: row.get::<_, i64>(1)? as usize,
+                stored_count: row.get::<_, i64>(2)? as usize,
+            }),
+        ).optional().map_err(|error| error.to_string())
     }
 
     pub fn list_amazon_continue_series(&self) -> Result<Vec<AmazonContinueSeriesItemView>, String> {
@@ -480,11 +502,17 @@ impl Database {
     }
 
     pub fn clear_amazon_continue_series(&self) -> Result<(), String> {
-        let connection = self.connect()?;
-        connection
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute("DELETE FROM amazon_continue_series_items", [])
             .map_err(|error| error.to_string())?;
-        Ok(())
+        transaction
+            .execute("DELETE FROM amazon_check_result", [])
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 }
 
@@ -659,6 +687,12 @@ CREATE TABLE IF NOT EXISTS amazon_continue_series_items (
   seen_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS amazon_continue_series_series ON amazon_continue_series_items(series_name, series_index);
+CREATE TABLE IF NOT EXISTS amazon_check_result (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  completed_at TEXT NOT NULL,
+  received_count INTEGER NOT NULL,
+  stored_count INTEGER NOT NULL
+);
 "#;
 
 fn normalize_amazon_image_url(value: Option<String>) -> Option<String> {
@@ -1105,7 +1139,16 @@ mod tests {
             ])
             .unwrap();
 
-        assert_eq!(stored, 1);
+        assert_eq!(stored.received_count, 4);
+        assert_eq!(stored.stored_count, 1);
+        assert_eq!(
+            database
+                .last_amazon_check_result()
+                .unwrap()
+                .unwrap()
+                .completed_at,
+            stored.completed_at
+        );
         let items = database.list_amazon_continue_series().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].asin, "B012345679");
@@ -1123,6 +1166,41 @@ mod tests {
 
         database.clear_amazon_continue_series().unwrap();
         assert!(database.list_amazon_continue_series().unwrap().is_empty());
+        assert!(database.last_amazon_check_result().unwrap().is_none());
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_amazon_success_survives_restart_and_failed_replacement() {
+        let (database, path) = test_database();
+        assert!(database.last_amazon_check_result().unwrap().is_none());
+        let result = database.replace_amazon_continue_series(vec![]).unwrap();
+        assert_eq!(result.received_count, 0);
+        assert_eq!(result.stored_count, 0);
+        drop(database);
+        let database = Database::initialize(path.clone()).unwrap();
+        let restored = database.last_amazon_check_result().unwrap().unwrap();
+        assert_eq!(restored.completed_at, result.completed_at);
+        assert_eq!(restored.received_count, 0);
+        let oversized = (0..501)
+            .map(|_| AmazonContinueSeriesItemInput {
+                asin: "B012345678".into(),
+                title: "test".into(),
+                price: Some(100),
+                has_rating: true,
+                image_url: None,
+            })
+            .collect();
+        assert!(database.replace_amazon_continue_series(oversized).is_err());
+        assert_eq!(
+            database
+                .last_amazon_check_result()
+                .unwrap()
+                .unwrap()
+                .completed_at,
+            result.completed_at
+        );
         drop(database);
         let _ = fs::remove_file(path);
     }

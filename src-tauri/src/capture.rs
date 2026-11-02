@@ -394,9 +394,8 @@ impl CaptureManager {
                         if let Some(handle) = previous_handle {
                             platform::check_foreground(handle)?;
                         }
-                        let window = manager.trace_step("open_reader", || {
-                            super::open_capture_reader_window(&app, &book.asin, options.portrait)
-                        })?;
+                        let window =
+                            open_fresh_batch_reader(&manager, &app, &book.asin, options.portrait)?;
                         manager.trace(
                             "window_ready",
                             json!({"width":window.width, "height":window.height}),
@@ -690,6 +689,50 @@ fn publish_backup(
         status.output_directory = destination.to_string_lossy().into_owned();
     }
     Ok(())
+}
+
+fn open_fresh_batch_reader(
+    manager: &CaptureManager,
+    app: &tauri::AppHandle,
+    asin: &str,
+    portrait: bool,
+) -> Result<CaptureWindow, String> {
+    if let Some(reader) = app.get_webview_window(super::CAPTURE_READER_LABEL) {
+        manager.trace_step("close_reader", || {
+            reader.close().map_err(|e| e.to_string())?;
+            drop(reader);
+            // close() is asynchronous. Do not reuse the label until Tauri has removed it.
+            wait_for_reader_closed(manager, Duration::from_secs(10), || {
+                app.get_webview_window(super::CAPTURE_READER_LABEL)
+                    .is_some()
+            })
+        })?;
+    }
+    wait(manager, Duration::ZERO)?;
+    // Reuse only the persistent profile, not the previous book's WebView/document.
+    // open_capture_reader_window uses the same data_directory; do not clear browsing data.
+    manager.trace_step("open_reader", || {
+        super::open_capture_reader_window(app, asin, portrait)
+    })
+}
+
+fn wait_for_reader_closed(
+    manager: &CaptureManager,
+    timeout: Duration,
+    mut is_open: impl FnMut() -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        wait(manager, Duration::ZERO)?;
+        if !is_open() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("内蔵リーダーの終了待ちが制限時間を超えました。次の本は開きません".into());
+        }
+        wait(manager, remaining.min(Duration::from_millis(50)))?;
+    }
 }
 
 fn wait_for_batch_reader(
@@ -2431,6 +2474,50 @@ mod tests {
         fs::write(&path, b"file").unwrap();
         assert!(has_capture_data(&path, || Ok(())).is_err());
         clean_test_directory(&root);
+    }
+
+    #[test]
+    fn reader_close_wait_accepts_an_already_closed_window() {
+        wait_for_reader_closed(&CaptureManager::default(), Duration::ZERO, || false).unwrap();
+    }
+
+    #[test]
+    fn reader_close_wait_rechecks_until_the_old_window_is_removed() {
+        let mut checks = 0;
+        wait_for_reader_closed(&CaptureManager::default(), Duration::from_secs(1), || {
+            checks += 1;
+            checks < 3
+        })
+        .unwrap();
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn reader_close_wait_times_out_instead_of_reusing_the_window() {
+        let error = wait_for_reader_closed(&CaptureManager::default(), Duration::ZERO, || true)
+            .unwrap_err();
+        assert!(error.contains("終了待ち"));
+        assert!(error.contains("次の本は開きません"));
+    }
+
+    #[test]
+    fn reader_close_wait_respects_cancellation_before_and_during_the_wait() {
+        let manager = CaptureManager::default();
+        manager.stop();
+        let error =
+            wait_for_reader_closed(&manager, Duration::ZERO, || panic!("cancelled")).unwrap_err();
+        assert!(error.contains("手動"));
+
+        let manager = CaptureManager::default();
+        let mut checks = 0;
+        let error = wait_for_reader_closed(&manager, Duration::from_secs(1), || {
+            checks += 1;
+            manager.stop();
+            true
+        })
+        .unwrap_err();
+        assert!(error.contains("手動"));
+        assert_eq!(checks, 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createBackupSettingsStore } from "./backupSettingsStore";
 import { createSeriesPreferencesStore } from "./seriesPreferencesStore";
-import type { AmazonContinueSeriesItem, BackupSettings, BatchCaptureOptions, Book, CaptureOptions, CapturePreview, CaptureStatus, CaptureWindow, KindleOpenKind, MetadataInput, SeriesMetadataInput, SeriesPreferences, SyncResult } from "./types";
+import type { AmazonCheckSnapshot, AmazonContinueSeriesItem, BackupSettings, BatchCaptureOptions, Book, CaptureOptions, CapturePreview, CaptureStatus, CaptureWindow, KindleOpenKind, MetadataInput, SeriesMetadataInput, SeriesPreferences, SyncResult } from "./types";
 
 const backupSettings = createBackupSettingsStore(
   () => invoke<BackupSettings>("get_backup_settings"),
@@ -27,6 +27,7 @@ export const api = {
   openKindleLibrary: () => invoke<void>("open_kindle_library"),
   openKofiDonation: () => invoke<void>("open_kofi_donation"),
   openAmazonContinueSeries: () => invoke<void>("open_amazon_continue_series"),
+  getAmazonCheckStatus: () => invoke<AmazonCheckSnapshot>("get_amazon_check_status"),
   listAmazonContinueSeries: () => invoke<AmazonContinueSeriesItem[]>("list_amazon_continue_series"),
   clearAmazonSession: () => invoke<void>("clear_amazon_session"),
   listCaptureWindows: () => invoke<CaptureWindow[]>("list_capture_windows"),
