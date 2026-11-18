@@ -7,7 +7,7 @@ const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'u
 const lifecycle = capture.slice(capture.indexOf('fn open_fresh_batch_reader('), capture.indexOf('fn wait_for_reader_closed('));
 
 test('every captured batch book opens a fresh reader after the foreground guard', () => {
-  const batch = capture.slice(capture.indexOf('pub fn start_batch('), capture.indexOf('pub fn preview('));
+  const batch = capture.slice(capture.indexOf('fn open_batch_reader_with_retry('), capture.indexOf('fn wait_for_reader_closed('));
   assert.ok(batch.indexOf('platform::check_foreground(handle)?') < batch.indexOf('open_fresh_batch_reader('));
   assert.match(batch, /let window =\s*open_fresh_batch_reader\(/);
   assert.doesNotMatch(batch, /super::open_capture_reader_window\(/);
