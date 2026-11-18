@@ -728,37 +728,313 @@ fn backup_root(
     Ok(root)
 }
 
+/// The backup index is keyed by the resolved root path.
+fn backup_root_key(root: &std::path::Path) -> String {
+    // Normalize the spellings that denote the same Windows folder
+    // (separator style, trailing separator, drive-letter case) so
+    // one root always maps to one index key and one scan slot.
+    let text = root.to_string_lossy().replace('/', "\\");
+    let trimmed = text.trim_end_matches('\\');
+    let mut chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() >= 2 && chars[1] == ':' {
+        chars[0] = chars[0].to_ascii_uppercase();
+    }
+    let normalized: String = chars.into_iter().collect();
+    if normalized.len() == 2 && normalized.ends_with(':') {
+        format!("{normalized}\\")
+    } else {
+        normalized
+    }
+}
+
+fn scanned_to_records(
+    report: &capture_output::ScanReport,
+) -> Vec<(String, database::BackupRecord)> {
+    report
+        .backups
+        .iter()
+        .map(|backup| {
+            (
+                backup.asin.clone(),
+                database::BackupRecord {
+                    archive_path: backup.path.to_string_lossy().into_owned(),
+                    format: backup.format.manifest_format().to_string(),
+                    pages: backup.pages,
+                    file_size: backup.file_size,
+                    mtime_nanos: backup.mtime_nanos,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Run the one-time (per root) filesystem scan that populates the
+/// backup index, unless it has already completed. Serialized against
+/// publish-time recording through the manager's index lock.
+/// Scan a root and replace its index entries with the result.
+/// The scan itself runs WITHOUT the index lock: it can take a
+/// long time on a slow drive, and holding the lock would block
+/// publishes and lookups for every root behind it. Only the final
+/// replace is serialized. `is_current` lets a superseded attempt
+/// bail out before replacing anything. A record published while
+/// the scan ran can be overwritten by the replace; the lookup
+/// path re-probes the destination and heals it.
+fn scan_and_replace_backup_index(
+    database: &Database,
+    manager: &capture::CaptureManager,
+    root: &std::path::Path,
+    is_current: &dyn Fn() -> bool,
+) -> Result<capture_output::ScanReport, String> {
+    let key = backup_root_key(root);
+    let report = capture_output::scan_backups(root)?;
+    if !is_current() {
+        return Ok(report);
+    }
+    let _guard = manager.lock_backup_index();
+    database.replace_backups(&key, &scanned_to_records(&report))?;
+    Ok(report)
+}
+
+/// Decide whether one book already has a valid backup under a root.
+/// The index record is trusted when the file still matches it (size
+/// and mtime, no zip opened); a changed or missing file is
+/// revalidated against its manifest once, and with no record the
+/// expected destination is probed (which also heals a record lost
+/// to a crash between publishing and recording).
+fn resolve_backed_up(
+    database: &Database,
+    manager: &capture::CaptureManager,
+    root: &std::path::Path,
+    asin: &str,
+    series_name: Option<&str>,
+    title: &str,
+) -> Result<bool, String> {
+    // The whole read-validate-write cycle runs under the index lock
+    // so a heal or clear here can never race a scan/replace or a
+    // publish-time record working from a stale snapshot.
+    let _index_guard = manager.lock_backup_index();
+    let key = backup_root_key(root);
+    if let Some(record) = database.backup_record(&key, asin)? {
+        let path = std::path::Path::new(&record.archive_path);
+        let stamp_matches = capture_output::file_stamp(path)
+            .map(|(size, mtime)| size == record.file_size && mtime == record.mtime_nanos)
+            .unwrap_or(false);
+        if stamp_matches {
+            return Ok(true);
+        }
+        match capture_output::read_manifest(path) {
+            Ok(Some((found_asin, format, pages))) if found_asin.eq_ignore_ascii_case(asin) => {
+                let (file_size, mtime_nanos) = capture_output::file_stamp(path)?;
+                database.record_backup(
+                    &key,
+                    asin,
+                    &database::BackupRecord {
+                        archive_path: record.archive_path.clone(),
+                        format: format.manifest_format().to_string(),
+                        pages,
+                        file_size,
+                        mtime_nanos,
+                    },
+                )?;
+                return Ok(true);
+            }
+            Ok(_) => {
+                database.clear_backup(&key, asin)?;
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    let destination = capture_output::archive_path(root, series_name, title, asin)?;
+    if destination.try_exists().map_err(|e| e.to_string())? {
+        if let Ok(Some((found_asin, format, pages))) =
+            capture_output::read_manifest(&destination)
+        {
+            if found_asin.eq_ignore_ascii_case(asin) {
+                let (file_size, mtime_nanos) = capture_output::file_stamp(&destination)?;
+                database.record_backup(
+                    &key,
+                    asin,
+                    &database::BackupRecord {
+                        archive_path: destination.to_string_lossy().into_owned(),
+                        format: format.manifest_format().to_string(),
+                        pages,
+                        file_size,
+                        mtime_nanos,
+                    },
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListPendingResult {
+    pending: Vec<i64>,
+    index_ready: bool,
+    scan_error: Option<String>,
+}
+
 #[tauri::command]
 async fn list_pending_backups(
     window: WebviewWindow,
     app: tauri::AppHandle,
     database: State<'_, Database>,
+    manager: State<'_, capture::CaptureManager>,
     output_directory: String,
     book_ids: Vec<i64>,
-) -> Result<Vec<i64>, String> {
+) -> Result<ListPendingResult, String> {
     require_main(&window)?;
     let books = database.list_books()?;
     let root = backup_root(&app, &output_directory)?;
+    let database = database.inner().clone();
+    let manager = manager.inner().clone();
     let selected: std::collections::HashSet<_> = book_ids.into_iter().collect();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut pending = Vec::new();
-        for book in books
+        let key = backup_root_key(&root);
+        let candidates: Vec<_> = books
             .into_iter()
             .filter(|b| {
                 b.source_status == "active" && !b.is_text_book && selected.contains(&b.id)
             })
-        {
-            let path = capture_output::archive_path(
-                &root,
-                book.effective_series_name.as_deref(),
-                &book.title,
-                &book.asin,
-            )?;
-            if !capture_output::has_backup(&path, &book.asin)? {
-                pending.push(book.id);
+            .collect();
+        if database.backup_scan_done(&key)? {
+            let mut pending = Vec::new();
+            for book in &candidates {
+                if !resolve_backed_up(
+                    &database,
+                    &manager,
+                    &root,
+                    &book.asin,
+                    book.effective_series_name.as_deref(),
+                    &book.title,
+                )? {
+                    pending.push(book.id);
+                }
+            }
+            return Ok(ListPendingResult {
+                pending,
+                index_ready: true,
+                scan_error: None,
+            });
+        }
+        // The one-time scan for this root has not finished. Never
+        // block the dialog on it: report every candidate as pending
+        // for now (the dialog shows a preparing state and does not
+        // act on the list) and make sure a background scan runs.
+        let scan_error = match manager.backup_scan_slot(&key) {
+            Some(capture::BackupScanSlot::Failed(error)) => Some(error),
+            Some(capture::BackupScanSlot::Running { .. }) => None,
+            None => {
+                if let Some(generation) = manager.begin_backup_scan(&key) {
+                    let database2 = database.clone();
+                    let manager2 = manager.clone();
+                    let root2 = root.clone();
+                    let key2 = key.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("mmk-backup-scan".into())
+                        .spawn(move || {
+                            let result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    scan_and_replace_backup_index(
+                                        &database2,
+                                        &manager2,
+                                        &root2,
+                                        &|| {
+                                            manager2.backup_scan_is_current(&key2, generation)
+                                        },
+                                    )
+                                    .map(|_| ())
+                                }),
+                            )
+                            .unwrap_or_else(|_| {
+                                Err("バックアップ記録の準備が異常終了しました".into())
+                            });
+                            manager2.finish_backup_scan(&key2, generation, result);
+                        });
+                    if spawned.is_err() {
+                        manager.finish_backup_scan(
+                            &key,
+                            generation,
+                            Err("バックアップ記録の準備を開始できませんでした".into()),
+                        );
+                    }
+                }
+                None
+            }
+        };
+        Ok(ListPendingResult {
+            pending: candidates.iter().map(|book| book.id).collect(),
+            index_ready: false,
+            scan_error,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RescanBackupsResult {
+    scanned: usize,
+    recorded: usize,
+    unrecognized: usize,
+}
+
+/// Rebuild one root's backup index from the files actually present.
+/// Refused while a capture is running, and serialized against
+/// publish-time recording through the index lock.
+#[tauri::command]
+async fn rescan_backups(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+    manager: State<'_, capture::CaptureManager>,
+    output_directory: String,
+) -> Result<RescanBackupsResult, String> {
+    require_main(&window)?;
+    if manager.status()?.running {
+        return Err("バックアップ実行中は再スキャンできません".into());
+    }
+    let root = backup_root(&app, &output_directory)?;
+    let database = database.inner().clone();
+    let manager = manager.inner().clone();
+    // A manual rescan supersedes any background attempt for the
+    // root, including one that appears stuck: taking a new
+    // generation makes the old worker settle nothing.
+    let key = backup_root_key(&root);
+    let generation = manager.force_begin_backup_scan(&key);
+    tauri::async_runtime::spawn_blocking(move || {
+        let settle = |result: Result<(), String>| {
+            manager.finish_backup_scan(&key, generation, result);
+        };
+        if manager.status()?.running {
+            settle(Ok(()));
+            return Err("バックアップ実行中は再スキャンできません".into());
+        }
+        let outcome = scan_and_replace_backup_index(&database, &manager, &root, &|| {
+            manager.backup_scan_is_current(&key, generation)
+        });
+        match outcome {
+            Ok(report) => {
+                if !manager.backup_scan_is_current(&key, generation) {
+                    return Err("再スキャンが別の操作に置き換えられました".into());
+                }
+                let recorded = report.backups.len();
+                settle(Ok(()));
+                Ok(RescanBackupsResult {
+                    scanned: report.scanned_files,
+                    recorded,
+                    unrecognized: report.unrecognized,
+                })
+            }
+            Err(error) => {
+                settle(Err(error.clone()));
+                Err(error)
             }
         }
-        Ok(pending)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -806,6 +1082,7 @@ fn start_batch_capture(
             title: book.title,
             series_name: book.effective_series_name,
             known_text_book: book.is_text_book,
+            has_backup: false,
         });
     }
     if settings.engine == backup_settings::BackupEngine::Desktop {
@@ -842,6 +1119,22 @@ fn start_batch_capture(
         let database_for_callback = database.inner().clone();
         let on_text_book: std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync> =
             std::sync::Arc::new(move |asin: &str| database_for_callback.mark_text_book(asin));
+        if !database.backup_scan_done(&backup_root_key(&root))? {
+            return Err(
+                "バックアップ記録の準備が終わっていません。しばらく待ってから開始してください"
+                    .into(),
+            );
+        }
+        for book in &mut books {
+            book.has_backup = resolve_backed_up(
+                database.inner(),
+                manager.inner(),
+                &root,
+                &book.asin,
+                book.series_name.as_deref(),
+                &book.title,
+            )?;
+        }
         return manager.start_batch_desktop(books, root, tool, settings.max_pages, on_text_book);
     }
     let directory = app
@@ -853,6 +1146,31 @@ fn start_batch_capture(
     // reader flow does not skip books for them.
     for book in &mut books {
         book.known_text_book = false;
+    }
+    // The web batch publishes under the caller's output directory
+    // when one is set (see CaptureManager::start_batch), so the
+    // index must be resolved against that same effective root, not
+    // the default directory.
+    let root = if options.output_directory.trim().is_empty() {
+        directory.clone()
+    } else {
+        std::path::PathBuf::from(options.output_directory.trim())
+    };
+    if !database.backup_scan_done(&backup_root_key(&root))? {
+        return Err(
+            "バックアップ記録の準備が終わっていません。しばらく待ってから開始してください"
+                .into(),
+        );
+    }
+    for book in &mut books {
+        book.has_backup = resolve_backed_up(
+            database.inner(),
+            manager.inner(),
+            &root,
+            &book.asin,
+            book.series_name.as_deref(),
+            &book.title,
+        )?;
     }
     manager.start_batch(options, books, directory, app)
 }
@@ -1168,7 +1486,37 @@ pub fn run() {
                 .last_amazon_check_result()
                 .map_err(std::io::Error::other)?;
             app.manage(amazon_check::ManagerState::new(last_result));
+            let database_for_sink = database.clone();
             app.manage(database);
+            // Record every published backup in the backup index. The
+            // sink computes the file stamp itself; failures are left
+            // for the lookup path to heal.
+            let on_published: std::sync::Arc<
+                dyn Fn(
+                        &std::path::Path,
+                        &str,
+                        &std::path::Path,
+                        u32,
+                        capture_output::ArchiveFormat,
+                    ) -> Result<(), String>
+                    + Send
+                    + Sync,
+            > = std::sync::Arc::new(move |root, asin, path, pages, format| {
+                let (file_size, mtime_nanos) = capture_output::file_stamp(path)?;
+                database_for_sink.record_backup(
+                    &backup_root_key(root),
+                    asin,
+                    &database::BackupRecord {
+                        archive_path: path.to_string_lossy().into_owned(),
+                        format: format.manifest_format().to_string(),
+                        pages,
+                        file_size,
+                        mtime_nanos,
+                    },
+                )
+            });
+            app.state::<capture::CaptureManager>()
+                .set_backup_sink(on_published);
             app.state::<capture::CaptureManager>()
                 .configure_logging(database_dir.join("logs").join("backup"));
             Ok(())
@@ -1206,8 +1554,10 @@ pub fn run() {
             choose_capture_root,
             get_backup_settings,
             save_backup_settings,
-            list_pending_backups
+            list_pending_backups,
+            rescan_backups
         ])
         .run(tauri::generate_context!())
         .expect("Manga Manager for Kindle の起動に失敗しました");
 }
+

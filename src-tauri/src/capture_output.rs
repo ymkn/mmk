@@ -87,6 +87,138 @@ fn archive_manifest(path: &Path) -> Result<Option<BackupManifest>, String> {
     Ok(Some(manifest))
 }
 
+/// The validated manifest of a published archive, for callers outside
+/// this module (backup index scans and revalidation). Ok(None) means
+/// the file is missing or is not a valid mmk archive; Err means the
+/// file could not be read at all.
+pub fn read_manifest(path: &Path) -> Result<Option<(String, ArchiveFormat, u32)>, String> {
+    match archive_manifest(path)? {
+        Some(manifest) => {
+            let format = ArchiveFormat::from_manifest(&manifest.format)
+                .ok_or_else(|| format!("未知のバックアップ形式です: {}", manifest.format))?;
+            Ok(Some((manifest.asin, format, manifest.pages)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// (File size, mtime as unix nanoseconds) of a file: enough to
+/// confirm an archive on disk is still the file an index record
+/// describes, without opening the zip.
+pub fn file_stamp(path: &Path) -> Result<(i64, i64), String> {
+    let metadata = fs::metadata(path).map_err(|e| format!("ファイルを確認できません: {e}"))?;
+    let nanos = metadata
+        .modified()
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mtime_nanos = i64::try_from(nanos).unwrap_or(i64::MAX);
+    Ok((metadata.len() as i64, mtime_nanos))
+}
+
+/// One valid archive found by [`scan_backups`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannedBackup {
+    pub asin: String,
+    pub path: PathBuf,
+    pub format: ArchiveFormat,
+    pub pages: u32,
+    pub file_size: i64,
+    pub mtime_nanos: i64,
+}
+
+/// Outcome of scanning a backup root: the valid archives to index,
+/// plus counts for reporting (CBZ files seen, files without a valid
+/// mmk manifest). Read errors abort the scan with Err instead: a
+/// partial index must never replace the stored one.
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    pub backups: Vec<ScannedBackup>,
+    pub scanned_files: usize,
+    pub unrecognized: usize,
+}
+
+/// Enumerate every valid mmk archive under a backup root (the root
+/// itself plus its series folders) for the backup index. Dot-folders
+/// such as .mmk-backup (capture work directories) are skipped, and
+/// directory symlinks are never followed outside the selected root.
+/// When several valid archives share an ASIN, the newest file wins.
+pub fn scan_backups(root: &Path) -> Result<ScanReport, String> {
+    let mut report = ScanReport::default();
+    if !root.try_exists().map_err(|e| e.to_string())? {
+        return Ok(report);
+    }
+    let mut directories = vec![root.to_path_buf()];
+    for entry in fs::read_dir(root).map_err(|e| format!("保存先を確認できません: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        // DirEntry::file_type does not follow symlinks, so a linked
+        // directory reports as a symlink, not a dir, and is skipped.
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        directories.push(entry.path());
+    }
+    let mut found: std::collections::HashMap<String, ScannedBackup> =
+        std::collections::HashMap::new();
+    for directory in directories {
+        for entry in
+            fs::read_dir(&directory).map_err(|e| format!("保存先を確認できません: {e}"))?
+        {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cbz"))
+            {
+                continue;
+            }
+            if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
+                continue;
+            }
+            report.scanned_files += 1;
+            let Some((asin, format, pages)) = read_manifest(&path)? else {
+                report.unrecognized += 1;
+                continue;
+            };
+            let asin = asin.to_uppercase();
+            if super::validate_asin(&asin).is_err() {
+                report.unrecognized += 1;
+                continue;
+            }
+            let (file_size, mtime_nanos) = file_stamp(&path)?;
+            let scanned = ScannedBackup {
+                asin: asin.clone(),
+                path,
+                format,
+                pages,
+                file_size,
+                mtime_nanos,
+            };
+            // Newest wins; ties break deterministically by size,
+            // then by path, so the choice never depends on read
+            // order.
+            let replace = match found.get(&asin) {
+                None => true,
+                Some(existing) => {
+                    (mtime_nanos, file_size) > (existing.mtime_nanos, existing.file_size)
+                        || ((mtime_nanos, file_size)
+                            == (existing.mtime_nanos, existing.file_size)
+                            && scanned.path < existing.path)
+                }
+            };
+            if replace {
+                found.insert(asin, scanned);
+            }
+        }
+    }
+    report.backups = found.into_values().collect();
+    Ok(report)
+}
+
 pub fn archive_path(
     root: &Path,
     series: Option<&str>,
@@ -394,6 +526,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scan_backups_indexes_valid_archives_and_counts_the_rest() {
+        let root = std::env::temp_dir().join(format!("mmk-scan-{}", uuid::Uuid::new_v4()));
+        // A valid archive inside a series folder.
+        let work = work_directory(&root, "B000000001").unwrap();
+        fs::write(work.join("screenshot_0001.png"), b"page").unwrap();
+        let destination = archive_path(&root, Some("シリーズ"), "書籍", "B000000001").unwrap();
+        finish_archive(&work, &destination, "B000000001", 1, || Ok(())).unwrap();
+        // A valid archive directly under the root.
+        let work = work_directory(&root, "B000000002").unwrap();
+        fs::write(work.join("screenshot_0001.png"), b"page").unwrap();
+        let loose = root.join("単独.cbz");
+        finish_archive(&work, &loose, "B000000002", 1, || Ok(())).unwrap();
+        // A .cbz without an mmk manifest (legacy library entry).
+        fs::write(root.join("旧ライブラリ.cbz"), b"not a zip").unwrap();
+        // A valid archive under .mmk-backup must not be indexed.
+        let hidden = root.join(".mmk-backup").join("隠し.cbz");
+        let work = work_directory(&root, "B000000003").unwrap();
+        fs::write(work.join("screenshot_0001.png"), b"page").unwrap();
+        finish_archive(&work, &hidden, "B000000003", 1, || Ok(())).unwrap();
+
+        let report = scan_backups(&root).unwrap();
+        assert_eq!(report.scanned_files, 3);
+        assert_eq!(report.unrecognized, 1);
+        let asins: Vec<&str> = report
+            .backups
+            .iter()
+            .map(|backup| backup.asin.as_str())
+            .collect();
+        assert_eq!(asins.len(), 2);
+        assert!(asins.contains(&"B000000001"));
+        assert!(asins.contains(&"B000000002"));
+        let first = report
+            .backups
+            .iter()
+            .find(|backup| backup.asin == "B000000001")
+            .unwrap();
+        assert_eq!(first.path, destination);
+        assert_eq!(first.pages, 1);
+        assert!(first.file_size > 0);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn cbz_round_trip_preserves_page_order_and_disambiguates_same_title() {
         let root = std::env::temp_dir().join(format!("mmk-cbz-{}", uuid::Uuid::new_v4()));
         let work = work_directory(&root, "B000000001").unwrap();
@@ -604,3 +779,4 @@ mod tests {
         fs::remove_dir(root).unwrap();
     }
 }
+

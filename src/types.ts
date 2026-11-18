@@ -33,6 +33,18 @@ export interface CapturePreview {
   warning: string | null;
 }
 
+export interface RescanBackupsResult {
+  scanned: number;
+  recorded: number;
+  unrecognized: number;
+}
+
+export interface ListPendingBackupsResult {
+  pending: number[];
+  indexReady: boolean;
+  scanError: string | null;
+}
+
 export interface CaptureStatus {
   running: boolean;
   savedPages: number;

@@ -97,6 +97,11 @@ pub struct BatchBook {
     /// Classified as a text book by an earlier desktop batch. Such books
     /// are skipped without being opened (desktop engine only).
     pub known_text_book: bool,
+    /// The backup index (plus a live file check) says a valid archive
+    /// already exists under the batch's output root. The batch runner
+    /// still falls back to checking the destination file itself when
+    /// this is false, so an index miss never causes a duplicate.
+    pub has_backup: bool,
 }
 
 impl BatchCaptureOptions {
@@ -197,6 +202,27 @@ pub struct CaptureStatus {
 /// batch, which is the only flow that can detect one.
 type TextBookSink = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// Records a freshly published backup in the backup index. Set once
+/// at app startup; receives (output root, ASIN, archive path, pages,
+/// format). A recording failure must never fail the publish itself:
+/// the index self-heals on the next lookup.
+type BackupSink = Arc<
+    dyn Fn(&Path, &str, &Path, u32, capture_output::ArchiveFormat) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+
+/// State of the one-time backup-index scan for one output root,
+/// tracked while the scan runs in the background so the backup
+/// dialog never has to wait for it. Each attempt carries a
+/// generation: a stuck attempt can be superseded by a newer one,
+/// and the stale worker then settles nothing.
+#[derive(Clone)]
+pub enum BackupScanSlot {
+    Running { generation: u64 },
+    Failed(String),
+}
+
 #[derive(Clone, Default)]
 pub struct CaptureManager {
     status: Arc<Mutex<CaptureStatus>>,
@@ -204,6 +230,10 @@ pub struct CaptureManager {
     log: Arc<Mutex<capture_log::CaptureLog>>,
     progress_stamp: Arc<Mutex<Option<(String, std::time::SystemTime)>>>,
     text_book_sink: Arc<Mutex<Option<TextBookSink>>>,
+    backup_sink: Arc<Mutex<Option<BackupSink>>>,
+    backup_index_lock: Arc<Mutex<()>>,
+    backup_scan_slots: Arc<Mutex<std::collections::HashMap<String, BackupScanSlot>>>,
+    backup_scan_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CaptureManager {
@@ -250,6 +280,106 @@ impl CaptureManager {
     pub fn configure_logging(&self, directory: PathBuf) {
         if let Ok(mut log) = self.log.lock() {
             log.configure(directory);
+        }
+    }
+
+    /// Install the backup-index recorder (called once at startup).
+    pub fn set_backup_sink(&self, sink: BackupSink) {
+        if let Ok(mut slot) = self.backup_sink.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    fn backup_sink(&self) -> Option<BackupSink> {
+        self.backup_sink.lock().ok()?.clone()
+    }
+
+    /// Serialize backup-index scans/replacements against publish-time
+    /// recording: a scan must never install a snapshot taken before a
+    /// concurrent publish, and a record must never land mid-replace.
+    pub fn lock_backup_index(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.backup_index_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Current background-scan state for one output root key.
+    pub fn backup_scan_slot(&self, key: &str) -> Option<BackupScanSlot> {
+        self.backup_scan_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    /// Claim the runner role for a root's background scan, returning
+    /// the attempt's generation. Returns None when a scan for the
+    /// root is already running.
+    pub fn begin_backup_scan(&self, key: &str) -> Option<u64> {
+        let mut slots = self
+            .backup_scan_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(slots.get(key), Some(BackupScanSlot::Running { .. })) {
+            return None;
+        }
+        let generation = self
+            .backup_scan_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        slots.insert(key.to_string(), BackupScanSlot::Running { generation });
+        Some(generation)
+    }
+
+    /// Take over a root's scan unconditionally (a manual rescan
+    /// superseding a running or stuck attempt) and return the new
+    /// generation. The superseded worker can no longer settle the
+    /// slot or replace the index.
+    pub fn force_begin_backup_scan(&self, key: &str) -> u64 {
+        let generation = self
+            .backup_scan_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.backup_scan_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), BackupScanSlot::Running { generation });
+        generation
+    }
+
+    /// Whether the given generation still owns the root's slot.
+    pub fn backup_scan_is_current(&self, key: &str, generation: u64) -> bool {
+        matches!(
+            self.backup_scan_slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(key),
+            Some(BackupScanSlot::Running { generation: current }) if *current == generation
+        )
+    }
+
+    /// Settle a root's scan attempt: success clears the slot (the
+    /// database scan state is the durable record), failure keeps
+    /// the error where the dialog can surface it. A superseded
+    /// generation settles nothing.
+    pub fn finish_backup_scan(&self, key: &str, generation: u64, result: Result<(), String>) {
+        let mut slots = self
+            .backup_scan_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(
+            slots.get(key),
+            Some(BackupScanSlot::Running { generation: current }) if *current == generation
+        ) {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                slots.remove(key);
+            }
+            Err(error) => {
+                slots.insert(key.to_string(), BackupScanSlot::Failed(error));
+            }
         }
     }
 
@@ -365,7 +495,7 @@ impl CaptureManager {
                     let _awake = platform::KeepAwake::new()?;
                     let end = run(&manager, &options, &target, &directory, reader.as_ref())?;
                     if end == CaptureEnd::LastPage {
-                        publish_backup(&manager, &directory, &destination, &options.asin)?;
+                        publish_backup(&manager, &root, &directory, &destination, &options.asin)?;
                     }
                     Ok::<_, String>(end)
                 }));
@@ -1209,7 +1339,15 @@ fn run_batch_inner(
                 continue;
             }
         };
-        match capture_output::has_backup(&destination, &book.asin) {
+        // The index-backed flag is authoritative when set; otherwise
+        // fall back to validating the destination file itself, so an
+        // index miss never causes a duplicate capture.
+        let existing = if book.has_backup {
+            Ok(true)
+        } else {
+            capture_output::has_backup(&destination, &book.asin)
+        };
+        match existing {
             Ok(true) => {
                 manager.trace("book_skipped", json!({"reason":"completed_archive_exists"}));
                 if let Ok(mut status) = manager.status.lock() {
@@ -1308,7 +1446,7 @@ fn run_batch_inner(
             }
         };
         if let Err(error) =
-            publish_backup_with_format(manager, &directory, &destination, &book.asin, format)
+            publish_backup_with_format(manager, root, &directory, &destination, &book.asin, format)
         {
             record_book_failure(manager, index, book, "publish_failed", &error)?;
             settle_before_next = true;
@@ -1324,12 +1462,14 @@ fn run_batch_inner(
 
 fn publish_backup(
     manager: &CaptureManager,
+    root: &Path,
     directory: &Path,
     destination: &Path,
     asin: &str,
 ) -> Result<(), String> {
     publish_backup_with_format(
         manager,
+        root,
         directory,
         destination,
         asin,
@@ -1339,6 +1479,7 @@ fn publish_backup(
 
 fn publish_backup_with_format(
     manager: &CaptureManager,
+    root: &Path,
     directory: &Path,
     destination: &Path,
     asin: &str,
@@ -1366,6 +1507,18 @@ fn publish_backup_with_format(
     manager.trace("archive_completed", json!({"savedPages":pages}));
     if let Ok(mut status) = manager.status.lock() {
         status.output_directory = destination.to_string_lossy().into_owned();
+    }
+    if let Some(sink) = manager.backup_sink() {
+        // Hold the index lock so a concurrent scan cannot install a
+        // snapshot taken before this publish. A recording failure is
+        // traced only; the lookup path revalidates and self-heals.
+        let _guard = manager.lock_backup_index();
+        if sink(root, asin, destination, pages, format).is_err() {
+            manager.trace(
+                "archive_record_failed",
+                json!({"bookFingerprint":format!("{:x}", md5::compute(asin.as_bytes()))}),
+            );
+        }
     }
     Ok(())
 }
@@ -3381,6 +3534,7 @@ mod tests {
                 title: asin.into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             })
             .collect()
     }
@@ -3584,6 +3738,48 @@ mod tests {
         let status = manager.status().unwrap();
         assert_eq!(status.failed_books, 1);
         assert_eq!(status.completed_books, 2);
+        clean_test_directory(&root);
+    }
+
+    #[test]
+    fn publish_records_the_backup_through_the_sink() {
+        let root = test_directory();
+        let manager = CaptureManager::default();
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_target = recorded.clone();
+        manager.set_backup_sink(std::sync::Arc::new(
+            move |root, asin, path, pages, format| {
+                sink_target.lock().unwrap().push((
+                    root.to_path_buf(),
+                    asin.to_string(),
+                    path.to_path_buf(),
+                    pages,
+                    format,
+                ));
+                Ok(())
+            },
+        ));
+        let directory = capture_output::work_directory(&root, "B000000001").unwrap();
+        fs::write(directory.join("screenshot_0001.jpg"), b"page").unwrap();
+        manager.status.lock().unwrap().saved_pages = 1;
+        let destination = root.join("シリーズ").join("書籍.cbz");
+        publish_backup_with_format(
+            &manager,
+            &root,
+            &directory,
+            &destination,
+            "B000000001",
+            capture_output::ArchiveFormat::JpegV2,
+        )
+        .unwrap();
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, root);
+        assert_eq!(recorded[0].1, "B000000001");
+        assert_eq!(recorded[0].2, destination);
+        assert_eq!(recorded[0].3, 1);
+        assert_eq!(recorded[0].4, capture_output::ArchiveFormat::JpegV2);
+        drop(recorded);
         clean_test_directory(&root);
     }
 
@@ -4902,18 +5098,21 @@ mod tests {
                 title: "Flaky".into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             },
             BatchBook {
                 asin: "B000000102".into(),
                 title: "Broken".into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             },
             BatchBook {
                 asin: "B000000103".into(),
                 title: "Good".into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             },
         ];
         let attempts: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
@@ -4969,18 +5168,21 @@ mod tests {
                     title: "Good".into(),
                     series_name: None,
                     known_text_book: false,
+                    has_backup: false,
                 },
                 BatchBook {
                     asin: "B000000102".into(),
                     title: "NoApp".into(),
                     series_name: None,
                     known_text_book: false,
+                    has_backup: false,
                 },
                 BatchBook {
                     asin: "B000000103".into(),
                     title: "Never".into(),
                     series_name: None,
                     known_text_book: false,
+                    has_backup: false,
                 },
             ];
             let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
@@ -5059,12 +5261,14 @@ mod tests {
                 title: "Novel".into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             },
             BatchBook {
                 asin: "B000000102".into(),
                 title: "Manga".into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             },
         ];
         let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
@@ -5109,6 +5313,7 @@ mod tests {
             title: "Novel".into(),
             series_name: None,
             known_text_book: false,
+            has_backup: false,
         }];
         let result = run_batch_inner(
             &manager,
@@ -5136,12 +5341,14 @@ mod tests {
                 title: "Novel".into(),
                 series_name: None,
                 known_text_book: true,
+                has_backup: false,
             },
             BatchBook {
                 asin: "B000000102".into(),
                 title: "Manga".into(),
                 series_name: None,
                 known_text_book: false,
+                has_backup: false,
             },
         ];
         let calls = Cell::new(0u32);
@@ -5187,6 +5394,7 @@ mod tests {
             title: "Flaky".into(),
             series_name: None,
             known_text_book: false,
+            has_backup: false,
         }];
         let mut attempts = 0;
         let result = run_batch_inner(

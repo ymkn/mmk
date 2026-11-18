@@ -17,6 +17,18 @@ pub struct Database {
     path: PathBuf,
 }
 
+/// One recorded backup archive under one output root. The file's
+/// size and mtime are stored so lookups can confirm the archive is
+/// still the file that was recorded without opening the zip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupRecord {
+    pub archive_path: String,
+    pub format: String,
+    pub pages: u32,
+    pub file_size: i64,
+    pub mtime_nanos: i64,
+}
+
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {
     let mut statement = connection
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -210,6 +222,170 @@ impl Database {
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<_, _>>()
             .map_err(|error| error.to_string())
+    }
+
+    /// Record that a backup exists for one ASIN under one output
+    /// root. Keyed by (root, ASIN) rather than by book row: the record
+    /// stays meaningful for ASINs the library has not imported yet,
+    /// and each output root keeps its own index (the same book can be
+    /// backed up under several roots). Callers verify the file's size
+    /// and mtime against the record before trusting it.
+    pub fn record_backup(
+        &self,
+        root_path: &str,
+        asin: &str,
+        record: &BackupRecord,
+    ) -> Result<(), String> {
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO backups (root_path, asin, archive_path, format, pages, file_size, mtime_nanos, backed_up_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(root_path, asin) DO UPDATE SET archive_path = excluded.archive_path, format = excluded.format, pages = excluded.pages, file_size = excluded.file_size, mtime_nanos = excluded.mtime_nanos, backed_up_at = excluded.backed_up_at",
+                params![
+                    root_path,
+                    asin.to_ascii_uppercase(),
+                    record.archive_path,
+                    record.format,
+                    record.pages,
+                    record.file_size,
+                    record.mtime_nanos,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// One index record for (root, ASIN), if any. ASINs are stored
+    /// uppercase; lookups normalize the same way.
+    pub fn backup_record(
+        &self,
+        root_path: &str,
+        asin: &str,
+    ) -> Result<Option<BackupRecord>, String> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT archive_path, format, pages, file_size, mtime_nanos FROM backups WHERE root_path = ?1 AND asin = ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![root_path, asin.to_ascii_uppercase()], |row| {
+                Ok(BackupRecord {
+                    archive_path: row.get(0)?,
+                    format: row.get(1)?,
+                    pages: row.get(2)?,
+                    file_size: row.get(3)?,
+                    mtime_nanos: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        let mut found = None;
+        for row in rows {
+            found = Some(row.map_err(|error| error.to_string())?);
+        }
+        Ok(found)
+    }
+
+    /// All backup records for one output root, keyed by ASIN.
+    pub fn backups_for_root(
+        &self,
+        root_path: &str,
+    ) -> Result<std::collections::HashMap<String, BackupRecord>, String> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT asin, archive_path, format, pages, file_size, mtime_nanos FROM backups WHERE root_path = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![root_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    BackupRecord {
+                        archive_path: row.get(1)?,
+                        format: row.get(2)?,
+                        pages: row.get(3)?,
+                        file_size: row.get(4)?,
+                        mtime_nanos: row.get(5)?,
+                    },
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Drop one root's record for an ASIN (its file failed validation).
+    pub fn clear_backup(&self, root_path: &str, asin: &str) -> Result<(), String> {
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "DELETE FROM backups WHERE root_path = ?1 AND asin = ?2",
+                params![root_path, asin.to_ascii_uppercase()],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Whether a full scan of this root has ever completed. Until it
+    /// has, lookups must not trust the (possibly empty) index.
+    pub fn backup_scan_done(&self, root_path: &str) -> Result<bool, String> {
+        let connection = self.connect()?;
+        let done: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM backup_scan_state WHERE root_path = ?1",
+                params![root_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(done.is_some())
+    }
+
+    /// Replace one root's whole index with a fresh scan and mark the
+    /// scan done, atomically: a crash mid-replace must not leave a
+    /// half-empty index that later lookups would trust.
+    pub fn replace_backups(
+        &self,
+        root_path: &str,
+        records: &[(String, BackupRecord)],
+    ) -> Result<(), String> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM backups WHERE root_path = ?1",
+                params![root_path],
+            )
+            .map_err(|error| error.to_string())?;
+        let now = Utc::now().to_rfc3339();
+        for (asin, record) in records {
+            transaction
+                .execute(
+                    "INSERT INTO backups (root_path, asin, archive_path, format, pages, file_size, mtime_nanos, backed_up_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        root_path,
+                        asin.to_ascii_uppercase(),
+                        record.archive_path,
+                        record.format,
+                        record.pages,
+                        record.file_size,
+                        record.mtime_nanos,
+                        now
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO backup_scan_state (root_path, scanned_at) VALUES (?1, ?2) ON CONFLICT(root_path) DO UPDATE SET scanned_at = excluded.scanned_at",
+                params![root_path, now],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     /// Remember that a book is a reflowable text book (the desktop
@@ -717,6 +893,21 @@ CREATE TABLE IF NOT EXISTS amazon_check_result (
   received_count INTEGER NOT NULL,
   stored_count INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS backups (
+  root_path TEXT NOT NULL,
+  asin TEXT NOT NULL,
+  archive_path TEXT NOT NULL,
+  format TEXT NOT NULL,
+  pages INTEGER NOT NULL,
+  file_size INTEGER NOT NULL,
+  mtime_nanos INTEGER NOT NULL,
+  backed_up_at TEXT NOT NULL,
+  PRIMARY KEY (root_path, asin)
+);
+CREATE TABLE IF NOT EXISTS backup_scan_state (
+  root_path TEXT PRIMARY KEY,
+  scanned_at TEXT NOT NULL
+);
 "#;
 
 fn normalize_amazon_image_url(value: Option<String>) -> Option<String> {
@@ -864,6 +1055,47 @@ mod tests {
             .sync(Path::new("metadata.xml"), &[imported("小説")], 0)
             .unwrap();
         assert!(database.list_books().unwrap()[0].is_text_book);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn backup_records_are_scoped_per_root_and_replaceable() {
+        let (database, path) = test_database();
+        let record = BackupRecord {
+            archive_path: "F:/books/series/title.cbz".into(),
+            format: "mmk-backup-v2".into(),
+            pages: 120,
+            file_size: 4567,
+            mtime_nanos: 890,
+        };
+        // No scan yet: the index must not be trusted.
+        assert!(!database.backup_scan_done("F:/books").unwrap());
+        database
+            .record_backup("F:/books", "B012345678", &record)
+            .unwrap();
+        // The same ASIN under another root is a separate record.
+        assert_eq!(
+            database.backups_for_root("F:/books").unwrap()["B012345678"],
+            record
+        );
+        assert!(database.backups_for_root("D:/other").unwrap().is_empty());
+        // A rescan replaces the root's index and marks the scan done,
+        // without touching other roots.
+        database
+            .record_backup("D:/other", "B012345678", &record)
+            .unwrap();
+        database
+            .replace_backups("F:/books", &[("B087654321".into(), record.clone())])
+            .unwrap();
+        assert!(database.backup_scan_done("F:/books").unwrap());
+        let replaced = database.backups_for_root("F:/books").unwrap();
+        assert!(!replaced.contains_key("B012345678"));
+        assert_eq!(replaced["B087654321"], record);
+        assert!(database.backups_for_root("D:/other").unwrap().contains_key("B012345678"));
+        // Clearing drops exactly one record.
+        database.clear_backup("D:/other", "B012345678").unwrap();
+        assert!(database.backups_for_root("D:/other").unwrap().is_empty());
         drop(database);
         let _ = fs::remove_file(path);
     }
