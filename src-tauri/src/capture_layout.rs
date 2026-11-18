@@ -130,6 +130,52 @@ pub fn reader_ready(
     serde_json::from_str(&result).map_err(|_| "本文の読み込み状態を確認できませんでした".into())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderPageState {
+    Reader,
+    AmazonError,
+    AmazonOther,
+    Loading,
+    Other,
+    // Never produced by the page script; used before the first observation
+    // so the log does not claim a state that was never seen.
+    Unknown,
+}
+
+impl ReaderPageState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::AmazonError => "amazon_error",
+            Self::AmazonOther => "amazon_other",
+            Self::Loading => "loading",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+pub fn reader_page_state(reader: &tauri::WebviewWindow) -> Result<ReaderPageState, String> {
+    let (send, receive) = mpsc::sync_channel(1);
+    reader
+        .eval_with_callback(include_str!("reader_page_state.js"), move |result| {
+            let _ = send.try_send(result);
+        })
+        .map_err(|e| e.to_string())?;
+    let result = receive
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|_| "ページ状態の確認が時間切れになりました")?;
+    let state: String =
+        serde_json::from_str(&result).map_err(|_| "ページ状態の判定ができませんでした")?;
+    Ok(match state.as_str() {
+        "reader" => ReaderPageState::Reader,
+        "amazon_error" => ReaderPageState::AmazonError,
+        "amazon_other" => ReaderPageState::AmazonOther,
+        "loading" => ReaderPageState::Loading,
+        _ => ReaderPageState::Other,
+    })
+}
+
 fn close_reader_toc(reader: &tauri::WebviewWindow) -> Result<(), String> {
     // Ionic ignores close() while its opening transition is still running.
     // During closing, wait for the backdrop as well as the close button to leave.

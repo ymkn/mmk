@@ -35,7 +35,7 @@ h1, h2, h3, p { margin-top: 0; } h1 { font-size: 22px; margin-bottom: 2px; } h2 
 .cover { display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 6px; background: #ddd5ca; box-shadow: 0 3px 10px rgba(49,37,25,.16); }.placeholder { display: grid; place-items: center; color: #81776d; font-size: 12px; }
 .book-title { display: block; font-weight: 600; margin-top: 8px; line-height: 1.35; min-height: 2.7em; overflow: hidden; }.muted { color: #766e65; font-size: 12px; }.one-line { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }.card-meta { margin-top: 5px; font-size: 12px; color: #6f6253; }
 .series-cover { position: relative; margin-right: 9px; }.book-stack { position: absolute; inset: 5px -5px -5px 5px; border: 1px solid #b8aa96; border-radius: 6px; z-index: -1; background: #efe9df; }
-.card-indicators { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }.note-indicator { display: inline-flex; align-items: center; }
+.card-indicators { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }.note-indicator { display: inline-flex; align-items: center; }.text-book-badge { display: inline-block; margin-top: 5px; padding: 1px 7px; border: 1px solid #ddd6cb; border-radius: 999px; background: #f4efe7; color: #766e65; font-size: 11px; }
 .empty-state { min-height: 45vh; display: grid; place-content: center; gap: 8px; text-align: center; color: #766e65; }
 .metadata-panel label { display: block; font-size: 12px; font-weight: 600; margin: 12px 0; }.metadata-panel input, .metadata-panel select, .metadata-panel textarea { width: 100%; margin-top: 5px; border: 1px solid #cfc7bc; border-radius: 6px; padding: 7px; background: white; }.detail-cover { width: 118px; margin: 4px auto 12px; }.read-button, .favorite-button, .save-button { width: 100%; text-align: center; }.score-editor { margin-top: 5px; display: grid; grid-template-columns: 38px 1fr 38px; align-items: center; }.score-editor button { border: 1px solid #cfc7bc; background: white; padding: 6px; }.score-editor output { text-align: center; font-size: 18px; }.hint { padding: 8px; border-radius: 6px; background: #eee9e1; font-size: 12px; }.metadata-panel dl { display: grid; grid-template-columns: 76px 1fr; gap: 5px; font-size: 11px; color: #71685e; }.metadata-panel dt { font-weight: 600; }.metadata-panel dd { margin: 0; overflow-wrap: anywhere; }
 .settings-panel h3 { margin-top: 8px; }.settings-select-label, .settings-path-label { display: block; font-size: 12px; font-weight: 600; margin: 12px 0; }.settings-panel input, .settings-panel select { width: 100%; margin-top: 5px; border: 1px solid #cfc7bc; border-radius: 6px; padding: 7px; background: white; }.settings-path-label input { font-size: 12px; }
@@ -103,3 +103,17 @@ h1, h2, h3, p { margin-top: 0; } h1 { font-size: 22px; margin-bottom: 2px; } h2 
 .batch-queue li { margin: 5px 0; font-size: 12px; }
 .batch-queue li span { display: inline-block; width: calc(100% - 100px); vertical-align: middle; }
 .batch-queue button { margin-left: 3px; border: 1px solid #d5cdbf; border-radius: 4px; background: #fff; cursor: pointer; }
+body.progress-view { min-width: 0; overflow: auto; }
+.progress-window { padding: 14px 18px; display: grid; gap: 7px; align-content: start; }
+.progress-status-line { display: flex; align-items: center; gap: 10px; }
+.progress-dot { width: 16px; height: 16px; border-radius: 50%; background: #9a917f; flex: none; }
+.progress-window[data-tone="running"] .progress-dot { background: #17a652; animation: progress-pulse 1.6s ease-in-out infinite; }
+.progress-window[data-tone="stalled"] .progress-dot { background: #d97706; }
+.progress-window[data-tone="error"] .progress-dot { background: #a22d22; }
+.progress-window[data-tone="done"] .progress-dot { background: #3d6fb4; }
+@keyframes progress-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.progress-state { font-size: 20px; }
+.progress-updated { margin-left: auto; font-size: 13px; color: #6d6455; white-space: nowrap; }
+.progress-title { margin: 0; font-size: 15px; font-weight: 600; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.progress-counts, .progress-pages { margin: 0; font-size: 14px; }
+.progress-failed, .progress-error { margin: 0; font-size: 12px; color: #a22d22; overflow-wrap: anywhere; }

@@ -33,6 +33,18 @@ export interface CapturePreview {
   warning: string | null;
 }
 
+export interface RescanBackupsResult {
+  scanned: number;
+  recorded: number;
+  unrecognized: number;
+}
+
+export interface ListPendingBackupsResult {
+  pending: number[];
+  indexReady: boolean;
+  scanError: string | null;
+}
+
 export interface CaptureStatus {
   running: boolean;
   savedPages: number;
@@ -44,11 +56,16 @@ export interface CaptureStatus {
   totalBooks: number;
   completedBooks: number;
   skippedBooks: number;
+  failedBooks: number;
+  failedTitles: string[];
+  textBooks: number;
+  textTitles: string[];
   currentTitle: string;
   currentPosition: number | null;
   totalPositions: number | null;
   logPath: string | null;
   logError: string | null;
+  progressUpdatedAt: number | null;
 }
 
 export interface BatchCaptureOptions {
@@ -58,6 +75,7 @@ export interface BatchCaptureOptions {
 
 export interface BackupSettings {
   pageLayout: "single" | "spread";
+  engine: "web" | "desktop";
   configPath: string;
 }
 
@@ -87,6 +105,7 @@ export interface Book {
   manualPublisher: string | null;
   label: string | null;
   tags: string[];
+  isTextBook: boolean;
 }
 
 export interface SyncResult {

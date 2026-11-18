@@ -37,6 +37,11 @@ export function BackupSettingsSection() {
           <button type="button" aria-pressed={settings.pageLayout === "single"} onClick={() => update({ ...settings, pageLayout: "single" })}>単ページ</button>
           <button type="button" aria-pressed={settings.pageLayout === "spread"} onClick={() => update({ ...settings, pageLayout: "spread" })}>見開き</button>
         </div>
+        <div className="capsule-options" role="group" aria-label="一括バックアップ方式">
+          <button type="button" aria-pressed={settings.engine === "web"} onClick={() => update({ ...settings, engine: "web" })}>Webリーダー</button>
+          <button type="button" aria-pressed={settings.engine === "desktop"} onClick={() => update({ ...settings, engine: "desktop" })}>デスクトップアプリ</button>
+        </div>
+        {settings.engine === "desktop" && <p className="muted">デスクトップ方式は一括バックアップ専用です（単冊はWeb方式）。撮影ツールのパスは設定ファイルの desktopToolPath で指定します。処理中はKindleアプリを操作しないでください。</p>}
       </fieldset>
       <button type="button" className="library-link" disabled={busy} onClick={() => {
         if (!window.confirm("バックアップ用リーダーを閉じ、Amazonのログイン状態と閲覧データを削除しますか？")) return;

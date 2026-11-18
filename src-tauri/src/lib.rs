@@ -678,13 +678,14 @@ fn get_backup_settings(
         .map_err(|e| e.to_string())?
         .join("backup-settings.json");
     let settings = backup_settings::load(&path)?;
-    Ok(serde_json::json!({ "pageLayout": settings.page_layout, "configPath": path }))
+    Ok(serde_json::json!({ "pageLayout": settings.page_layout, "engine": settings.engine, "configPath": path }))
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BackupSettingsInput {
     page_layout: backup_settings::PageLayout,
+    engine: backup_settings::BackupEngine,
 }
 
 #[tauri::command]
@@ -699,7 +700,7 @@ fn save_backup_settings(
         .app_config_dir()
         .map_err(|e| e.to_string())?
         .join("backup-settings.json");
-    backup_settings::update_visible_settings(&path, settings.page_layout)
+    backup_settings::update_visible(&path, settings.page_layout, settings.engine)
 }
 
 #[derive(serde::Deserialize)]
@@ -727,35 +728,313 @@ fn backup_root(
     Ok(root)
 }
 
+/// The backup index is keyed by the resolved root path.
+fn backup_root_key(root: &std::path::Path) -> String {
+    // Normalize the spellings that denote the same Windows folder
+    // (separator style, trailing separator, drive-letter case) so
+    // one root always maps to one index key and one scan slot.
+    let text = root.to_string_lossy().replace('/', "\\");
+    let trimmed = text.trim_end_matches('\\');
+    let mut chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() >= 2 && chars[1] == ':' {
+        chars[0] = chars[0].to_ascii_uppercase();
+    }
+    let normalized: String = chars.into_iter().collect();
+    if normalized.len() == 2 && normalized.ends_with(':') {
+        format!("{normalized}\\")
+    } else {
+        normalized
+    }
+}
+
+fn scanned_to_records(
+    report: &capture_output::ScanReport,
+) -> Vec<(String, database::BackupRecord)> {
+    report
+        .backups
+        .iter()
+        .map(|backup| {
+            (
+                backup.asin.clone(),
+                database::BackupRecord {
+                    archive_path: backup.path.to_string_lossy().into_owned(),
+                    format: backup.format.manifest_format().to_string(),
+                    pages: backup.pages,
+                    file_size: backup.file_size,
+                    mtime_nanos: backup.mtime_nanos,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Run the one-time (per root) filesystem scan that populates the
+/// backup index, unless it has already completed. Serialized against
+/// publish-time recording through the manager's index lock.
+/// Scan a root and replace its index entries with the result.
+/// The scan itself runs WITHOUT the index lock: it can take a
+/// long time on a slow drive, and holding the lock would block
+/// publishes and lookups for every root behind it. Only the final
+/// replace is serialized. `is_current` lets a superseded attempt
+/// bail out before replacing anything. A record published while
+/// the scan ran can be overwritten by the replace; the lookup
+/// path re-probes the destination and heals it.
+fn scan_and_replace_backup_index(
+    database: &Database,
+    manager: &capture::CaptureManager,
+    root: &std::path::Path,
+    is_current: &dyn Fn() -> bool,
+) -> Result<capture_output::ScanReport, String> {
+    let key = backup_root_key(root);
+    let report = capture_output::scan_backups(root)?;
+    if !is_current() {
+        return Ok(report);
+    }
+    let _guard = manager.lock_backup_index();
+    database.replace_backups(&key, &scanned_to_records(&report))?;
+    Ok(report)
+}
+
+/// Decide whether one book already has a valid backup under a root.
+/// The index record is trusted when the file still matches it (size
+/// and mtime, no zip opened); a changed or missing file is
+/// revalidated against its manifest once, and with no record the
+/// expected destination is probed (which also heals a record lost
+/// to a crash between publishing and recording).
+fn resolve_backed_up(
+    database: &Database,
+    manager: &capture::CaptureManager,
+    root: &std::path::Path,
+    asin: &str,
+    series_name: Option<&str>,
+    title: &str,
+) -> Result<bool, String> {
+    // The whole read-validate-write cycle runs under the index lock
+    // so a heal or clear here can never race a scan/replace or a
+    // publish-time record working from a stale snapshot.
+    let _index_guard = manager.lock_backup_index();
+    let key = backup_root_key(root);
+    if let Some(record) = database.backup_record(&key, asin)? {
+        let path = std::path::Path::new(&record.archive_path);
+        let stamp_matches = capture_output::file_stamp(path)
+            .map(|(size, mtime)| size == record.file_size && mtime == record.mtime_nanos)
+            .unwrap_or(false);
+        if stamp_matches {
+            return Ok(true);
+        }
+        match capture_output::read_manifest(path) {
+            Ok(Some((found_asin, format, pages))) if found_asin.eq_ignore_ascii_case(asin) => {
+                let (file_size, mtime_nanos) = capture_output::file_stamp(path)?;
+                database.record_backup(
+                    &key,
+                    asin,
+                    &database::BackupRecord {
+                        archive_path: record.archive_path.clone(),
+                        format: format.manifest_format().to_string(),
+                        pages,
+                        file_size,
+                        mtime_nanos,
+                    },
+                )?;
+                return Ok(true);
+            }
+            Ok(_) => {
+                database.clear_backup(&key, asin)?;
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    let destination = capture_output::archive_path(root, series_name, title, asin)?;
+    if destination.try_exists().map_err(|e| e.to_string())? {
+        if let Ok(Some((found_asin, format, pages))) =
+            capture_output::read_manifest(&destination)
+        {
+            if found_asin.eq_ignore_ascii_case(asin) {
+                let (file_size, mtime_nanos) = capture_output::file_stamp(&destination)?;
+                database.record_backup(
+                    &key,
+                    asin,
+                    &database::BackupRecord {
+                        archive_path: destination.to_string_lossy().into_owned(),
+                        format: format.manifest_format().to_string(),
+                        pages,
+                        file_size,
+                        mtime_nanos,
+                    },
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListPendingResult {
+    pending: Vec<i64>,
+    index_ready: bool,
+    scan_error: Option<String>,
+}
+
 #[tauri::command]
 async fn list_pending_backups(
     window: WebviewWindow,
     app: tauri::AppHandle,
     database: State<'_, Database>,
+    manager: State<'_, capture::CaptureManager>,
     output_directory: String,
     book_ids: Vec<i64>,
-) -> Result<Vec<i64>, String> {
+) -> Result<ListPendingResult, String> {
     require_main(&window)?;
     let books = database.list_books()?;
     let root = backup_root(&app, &output_directory)?;
+    let database = database.inner().clone();
+    let manager = manager.inner().clone();
     let selected: std::collections::HashSet<_> = book_ids.into_iter().collect();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut pending = Vec::new();
-        for book in books
+        let key = backup_root_key(&root);
+        let candidates: Vec<_> = books
             .into_iter()
-            .filter(|b| b.source_status == "active" && selected.contains(&b.id))
-        {
-            let path = capture_output::archive_path(
-                &root,
-                book.effective_series_name.as_deref(),
-                &book.title,
-                &book.asin,
-            )?;
-            if !capture_output::has_backup(&path, &book.asin)? {
-                pending.push(book.id);
+            .filter(|b| {
+                b.source_status == "active" && !b.is_text_book && selected.contains(&b.id)
+            })
+            .collect();
+        if database.backup_scan_done(&key)? {
+            let mut pending = Vec::new();
+            for book in &candidates {
+                if !resolve_backed_up(
+                    &database,
+                    &manager,
+                    &root,
+                    &book.asin,
+                    book.effective_series_name.as_deref(),
+                    &book.title,
+                )? {
+                    pending.push(book.id);
+                }
+            }
+            return Ok(ListPendingResult {
+                pending,
+                index_ready: true,
+                scan_error: None,
+            });
+        }
+        // The one-time scan for this root has not finished. Never
+        // block the dialog on it: report every candidate as pending
+        // for now (the dialog shows a preparing state and does not
+        // act on the list) and make sure a background scan runs.
+        let scan_error = match manager.backup_scan_slot(&key) {
+            Some(capture::BackupScanSlot::Failed(error)) => Some(error),
+            Some(capture::BackupScanSlot::Running { .. }) => None,
+            None => {
+                if let Some(generation) = manager.begin_backup_scan(&key) {
+                    let database2 = database.clone();
+                    let manager2 = manager.clone();
+                    let root2 = root.clone();
+                    let key2 = key.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("mmk-backup-scan".into())
+                        .spawn(move || {
+                            let result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    scan_and_replace_backup_index(
+                                        &database2,
+                                        &manager2,
+                                        &root2,
+                                        &|| {
+                                            manager2.backup_scan_is_current(&key2, generation)
+                                        },
+                                    )
+                                    .map(|_| ())
+                                }),
+                            )
+                            .unwrap_or_else(|_| {
+                                Err("バックアップ記録の準備が異常終了しました".into())
+                            });
+                            manager2.finish_backup_scan(&key2, generation, result);
+                        });
+                    if spawned.is_err() {
+                        manager.finish_backup_scan(
+                            &key,
+                            generation,
+                            Err("バックアップ記録の準備を開始できませんでした".into()),
+                        );
+                    }
+                }
+                None
+            }
+        };
+        Ok(ListPendingResult {
+            pending: candidates.iter().map(|book| book.id).collect(),
+            index_ready: false,
+            scan_error,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RescanBackupsResult {
+    scanned: usize,
+    recorded: usize,
+    unrecognized: usize,
+}
+
+/// Rebuild one root's backup index from the files actually present.
+/// Refused while a capture is running, and serialized against
+/// publish-time recording through the index lock.
+#[tauri::command]
+async fn rescan_backups(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+    manager: State<'_, capture::CaptureManager>,
+    output_directory: String,
+) -> Result<RescanBackupsResult, String> {
+    require_main(&window)?;
+    if manager.status()?.running {
+        return Err("バックアップ実行中は再スキャンできません".into());
+    }
+    let root = backup_root(&app, &output_directory)?;
+    let database = database.inner().clone();
+    let manager = manager.inner().clone();
+    // A manual rescan supersedes any background attempt for the
+    // root, including one that appears stuck: taking a new
+    // generation makes the old worker settle nothing.
+    let key = backup_root_key(&root);
+    let generation = manager.force_begin_backup_scan(&key);
+    tauri::async_runtime::spawn_blocking(move || {
+        let settle = |result: Result<(), String>| {
+            manager.finish_backup_scan(&key, generation, result);
+        };
+        if manager.status()?.running {
+            settle(Ok(()));
+            return Err("バックアップ実行中は再スキャンできません".into());
+        }
+        let outcome = scan_and_replace_backup_index(&database, &manager, &root, &|| {
+            manager.backup_scan_is_current(&key, generation)
+        });
+        match outcome {
+            Ok(report) => {
+                if !manager.backup_scan_is_current(&key, generation) {
+                    return Err("再スキャンが別の操作に置き換えられました".into());
+                }
+                let recorded = report.backups.len();
+                settle(Ok(()));
+                Ok(RescanBackupsResult {
+                    scanned: report.scanned_files,
+                    recorded,
+                    unrecognized: report.unrecognized,
+                })
+            }
+            Err(error) => {
+                settle(Err(error.clone()));
+                Err(error)
             }
         }
-        Ok(pending)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -802,13 +1081,97 @@ fn start_batch_capture(
             asin: book.asin,
             title: book.title,
             series_name: book.effective_series_name,
+            known_text_book: book.is_text_book,
+            has_backup: false,
         });
+    }
+    if settings.engine == backup_settings::BackupEngine::Desktop {
+        let tool_path = settings.desktop_tool_path.trim();
+        if tool_path.is_empty() {
+            return Err("デスクトップ方式のツールパスが未設定です。設定ファイル（backup-settings.json）の desktopToolPath に ShotAndPackKindle.exe のパスを設定してください".into());
+        }
+        let tool = std::path::PathBuf::from(tool_path);
+        if !tool.is_file() {
+            return Err(format!(
+                "デスクトップ撮影ツールが見つかりません: {}",
+                tool.display()
+            ));
+        }
+        let probe = std::process::Command::new(&tool)
+            .arg("--check")
+            .output()
+            .map_err(|e| format!("デスクトップ撮影ツールを起動できません: {e}"))?;
+        let report: serde_json::Value =
+            serde_json::from_slice(&probe.stdout).unwrap_or(serde_json::Value::Null);
+        if !probe.status.success() || report.get("protocol").and_then(|v| v.as_u64()) != Some(1) {
+            return Err("デスクトップ撮影ツールのバージョンが適合しません（protocol 1 が必要です）".into());
+        }
+        if report.get("allowLaunch").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("デスクトップ撮影ツールが旧版です（バッチ中のアプリ再起動を抑止できる版が必要です）".into());
+        }
+        if report.get("textBook").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("デスクトップ撮影ツールが旧版です（テキスト形式の本を判定できる版が必要です）".into());
+        }
+        if report.get("windowLossFailFast").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("デスクトップ撮影ツールが旧版です（ウィンドウ消失を即時に検知できる版が必要です）".into());
+        }
+        let root = backup_root(&app, &options.output_directory)?;
+        let database_for_callback = database.inner().clone();
+        let on_text_book: std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync> =
+            std::sync::Arc::new(move |asin: &str| database_for_callback.mark_text_book(asin));
+        if !database.backup_scan_done(&backup_root_key(&root))? {
+            return Err(
+                "バックアップ記録の準備が終わっていません。しばらく待ってから開始してください"
+                    .into(),
+            );
+        }
+        for book in &mut books {
+            book.has_backup = resolve_backed_up(
+                database.inner(),
+                manager.inner(),
+                &root,
+                &book.asin,
+                book.series_name.as_deref(),
+                &book.title,
+            )?;
+        }
+        return manager.start_batch_desktop(books, root, tool, settings.max_pages, on_text_book);
     }
     let directory = app
         .path()
         .picture_dir()
         .map_err(|e| e.to_string())?
         .join("MMK");
+    // Text-book classifications come from the desktop tool; the web
+    // reader flow does not skip books for them.
+    for book in &mut books {
+        book.known_text_book = false;
+    }
+    // The web batch publishes under the caller's output directory
+    // when one is set (see CaptureManager::start_batch), so the
+    // index must be resolved against that same effective root, not
+    // the default directory.
+    let root = if options.output_directory.trim().is_empty() {
+        directory.clone()
+    } else {
+        std::path::PathBuf::from(options.output_directory.trim())
+    };
+    if !database.backup_scan_done(&backup_root_key(&root))? {
+        return Err(
+            "バックアップ記録の準備が終わっていません。しばらく待ってから開始してください"
+                .into(),
+        );
+    }
+    for book in &mut books {
+        book.has_backup = resolve_backed_up(
+            database.inner(),
+            manager.inner(),
+            &root,
+            &book.asin,
+            book.series_name.as_deref(),
+            &book.title,
+        )?;
+    }
     manager.start_batch(options, books, directory, app)
 }
 
@@ -817,8 +1180,194 @@ fn page_capture_status(
     window: WebviewWindow,
     manager: State<'_, capture::CaptureManager>,
 ) -> Result<capture::CaptureStatus, String> {
-    require_main(&window)?;
+    require_main_or_progress(&window)?;
     manager.status()
+}
+
+const PROGRESS_WINDOW_LABEL: &str = "progress";
+
+fn require_main_or_progress(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() == "main" || window.label() == PROGRESS_WINDOW_LABEL {
+        Ok(())
+    } else {
+        Err("この操作はメイン画面または進捗画面からのみ実行できます".to_owned())
+    }
+}
+
+fn progress_window_position_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("progress-window-position.txt"))
+        .map_err(|error| error.to_string())
+}
+
+fn load_progress_window_position(app: &tauri::AppHandle) -> Option<tauri::PhysicalPosition<i32>> {
+    let path = progress_window_position_path(app).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let (x, y) = text.trim().split_once(',')?;
+    Some(tauri::PhysicalPosition::new(x.parse().ok()?, y.parse().ok()?))
+}
+
+fn save_progress_window_position(app: &tauri::AppHandle, position: tauri::PhysicalPosition<i32>) {
+    let Ok(path) = progress_window_position_path(app) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 途中終了で位置ファイルが壊れないよう、一時ファイル経由で置き換える。
+    // 置換に失敗する環境向けに、既存を消してから再試行するフォールバック付き。
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, format!("{},{}", position.x, position.y)).is_ok()
+        && std::fs::rename(&temp, &path).is_err()
+    {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::rename(&temp, &path);
+    }
+}
+
+fn progress_window_target_position(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    let monitors = window.available_monitors().ok()?;
+    let outer = window.outer_size().ok()?;
+    // ウィンドウ全体がモニターの作業領域に収まるよう左上をクランプする。
+    let clamp_into = |position: tauri::PhysicalPosition<i32>,
+                      monitor: &tauri::Monitor|
+     -> tauri::PhysicalPosition<i32> {
+        let area = monitor.work_area();
+        let max_x = area.position.x + area.size.width as i32 - outer.width as i32;
+        let max_y = area.position.y + area.size.height as i32 - outer.height as i32;
+        tauri::PhysicalPosition::new(
+            position.x.clamp(area.position.x, max_x.max(area.position.x)),
+            position.y.clamp(area.position.y, max_y.max(area.position.y)),
+        )
+    };
+    if let Some(saved) = load_progress_window_position(app) {
+        let host = monitors.iter().find(|monitor| {
+            let origin = monitor.position();
+            let size = monitor.size();
+            saved.x >= origin.x
+                && saved.y >= origin.y
+                && saved.x < origin.x + size.width as i32
+                && saved.y < origin.y + size.height as i32
+        });
+        if let Some(monitor) = host {
+            return Some(clamp_into(saved, monitor));
+        }
+    }
+    // 初回は、あればセカンダリモニターの左上に置く。メインモニターは
+    // バックアップ中に Kindle アプリが全画面で使うため。
+    let primary = window.primary_monitor().ok()??;
+    let secondary = monitors
+        .iter()
+        .find(|monitor| monitor.position() != primary.position())?;
+    let origin = secondary.position();
+    Some(clamp_into(
+        tauri::PhysicalPosition::new(origin.x + 24, origin.y + 24),
+        secondary,
+    ))
+}
+
+#[tauri::command]
+async fn open_progress_window(window: WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    require_main(&window)?;
+    // 自動表示と手動表示の同時実行で生成・表示が競合しないよう直列化する。
+    static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _open_guard = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = app.get_webview_window(PROGRESS_WINDOW_LABEL) {
+        let _ = existing.unminimize();
+        if existing.show().is_ok() {
+            // モニター切断などで画面外に残っていたら、収まる位置へ寄せる。
+            let off_screen = match (existing.outer_position(), existing.available_monitors()) {
+                (Ok(position), Ok(monitors)) => !monitors.iter().any(|monitor| {
+                    let origin = monitor.position();
+                    let size = monitor.size();
+                    position.x >= origin.x
+                        && position.y >= origin.y
+                        && position.x < origin.x + size.width as i32
+                        && position.y < origin.y + size.height as i32
+                }),
+                _ => false,
+            };
+            if off_screen {
+                if let Some(target) = progress_window_target_position(&app, &existing) {
+                    let _ = existing.set_position(target);
+                }
+            }
+            return Ok(());
+        }
+        // 閉じかけで表示できなかった場合は、新規作成へフォールバックする。
+        let _ = existing.close();
+    }
+    let progress_window = match WebviewWindowBuilder::new(
+        &app,
+        PROGRESS_WINDOW_LABEL,
+        WebviewUrl::App("index.html?view=progress".into()),
+    )
+    .title("バックアップ進捗")
+    .inner_size(400.0, 240.0)
+    .resizable(false)
+    .always_on_top(true)
+    .focused(false)
+    .visible(false)
+    .build()
+    {
+        Ok(window) => window,
+        Err(error) => {
+            // 自動表示と手動表示が競合して同ラベルが既に作られていた場合は、
+            // そちらを表示して成功扱いにする。
+            if let Some(existing) = app.get_webview_window(PROGRESS_WINDOW_LABEL) {
+                let _ = existing.unminimize();
+                existing.show().map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+    };
+    if let Some(position) = progress_window_target_position(&app, &progress_window) {
+        let _ = progress_window.set_position(position);
+    }
+    // 位置が決まってから表示する（既定モニターに一瞬出てから移動するのを防ぐ）。
+    progress_window.show().map_err(|error| error.to_string())?;
+    // メインウィンドウが閉じたら進捗ウィンドウも閉じ、プロセスが
+    // 進捗ウィンドウだけを残して生き続けないようにする。
+    if let Some(main) = app.get_webview_window("main") {
+        let progress_for_hook = progress_window.clone();
+        main.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let _ = progress_for_hook.close();
+            }
+        });
+    }
+    let handle = app.clone();
+    let event_window = progress_window.clone();
+    let last_saved = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    progress_window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Moved(position) => {
+            let should_save = {
+                let mut last = last_saved.lock().unwrap();
+                match *last {
+                    Some(at) if at.elapsed() < std::time::Duration::from_millis(300) => false,
+                    _ => {
+                        *last = Some(std::time::Instant::now());
+                        true
+                    }
+                }
+            };
+            if should_save {
+                save_progress_window_position(&handle, *position);
+            }
+        }
+        tauri::WindowEvent::CloseRequested { .. } => {
+            if let Ok(position) = event_window.outer_position() {
+                save_progress_window_position(&handle, position);
+            }
+        }
+        _ => {}
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -937,7 +1486,37 @@ pub fn run() {
                 .last_amazon_check_result()
                 .map_err(std::io::Error::other)?;
             app.manage(amazon_check::ManagerState::new(last_result));
+            let database_for_sink = database.clone();
             app.manage(database);
+            // Record every published backup in the backup index. The
+            // sink computes the file stamp itself; failures are left
+            // for the lookup path to heal.
+            let on_published: std::sync::Arc<
+                dyn Fn(
+                        &std::path::Path,
+                        &str,
+                        &std::path::Path,
+                        u32,
+                        capture_output::ArchiveFormat,
+                    ) -> Result<(), String>
+                    + Send
+                    + Sync,
+            > = std::sync::Arc::new(move |root, asin, path, pages, format| {
+                let (file_size, mtime_nanos) = capture_output::file_stamp(path)?;
+                database_for_sink.record_backup(
+                    &backup_root_key(root),
+                    asin,
+                    &database::BackupRecord {
+                        archive_path: path.to_string_lossy().into_owned(),
+                        format: format.manifest_format().to_string(),
+                        pages,
+                        file_size,
+                        mtime_nanos,
+                    },
+                )
+            });
+            app.state::<capture::CaptureManager>()
+                .set_backup_sink(on_published);
             app.state::<capture::CaptureManager>()
                 .configure_logging(database_dir.join("logs").join("backup"));
             Ok(())
@@ -968,14 +1547,17 @@ pub fn run() {
             start_page_capture,
             start_batch_capture,
             page_capture_status,
+            open_progress_window,
             stop_page_capture,
             open_capture_directory,
             preview_capture_layout,
             choose_capture_root,
             get_backup_settings,
             save_backup_settings,
-            list_pending_backups
+            list_pending_backups,
+            rescan_backups
         ])
         .run(tauri::generate_context!())
         .expect("Manga Manager for Kindle の起動に失敗しました");
 }
+

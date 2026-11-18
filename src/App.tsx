@@ -223,6 +223,7 @@ function BookCard({ book, selected, onSelect, onOpenKindle }: { book: Book; sele
       <span className="book-title">{book.title}</span>
       <span className="muted one-line">{book.authors.join("、") || "著者不明"}</span>
       <CardMetadata score={book.score} favorite={book.favorite} />
+      {book.isTextBook && <span className="text-book-badge">テキスト本</span>}
     </button>
   );
 }

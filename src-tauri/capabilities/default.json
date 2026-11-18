@@ -27,6 +27,7 @@
     "allow-start-page-capture",
     "allow-start-batch-capture",
     "allow-page-capture-status",
+    "allow-open-progress-window",
     "allow-stop-page-capture",
     "allow-open-capture-directory",
     "allow-preview-capture-layout",

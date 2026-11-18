@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createBackupSettingsStore } from "./backupSettingsStore";
 import { createSeriesPreferencesStore } from "./seriesPreferencesStore";
-import type { AmazonCheckSnapshot, AmazonContinueSeriesItem, BackupSettings, BatchCaptureOptions, Book, CaptureOptions, CapturePreview, CaptureStatus, CaptureWindow, KindleOpenKind, MetadataInput, SeriesMetadataInput, SeriesPreferences, SyncResult } from "./types";
+import type { AmazonCheckSnapshot, AmazonContinueSeriesItem, BackupSettings, BatchCaptureOptions, Book, CaptureOptions, CapturePreview, CaptureStatus, CaptureWindow, KindleOpenKind, ListPendingBackupsResult, MetadataInput, RescanBackupsResult, SeriesMetadataInput, SeriesPreferences, SyncResult } from "./types";
 
 const backupSettings = createBackupSettingsStore(
   () => invoke<BackupSettings>("get_backup_settings"),
@@ -35,10 +35,12 @@ export const api = {
   clearCaptureReaderSession: () => invoke<void>("clear_capture_reader_session"),
   startPageCapture: (options: CaptureOptions) => invoke<void>("start_page_capture", { options }),
   startBatchCapture: (options: BatchCaptureOptions) => backupSettings.afterPending(() => invoke<void>("start_batch_capture", { options })),
-  listPendingBackups: (outputDirectory: string, bookIds: number[]) => invoke<number[]>("list_pending_backups", { outputDirectory, bookIds }),
+  listPendingBackups: (outputDirectory: string, bookIds: number[]) => invoke<ListPendingBackupsResult>("list_pending_backups", { outputDirectory, bookIds }),
+  rescanBackups: (outputDirectory: string) => invoke<RescanBackupsResult>("rescan_backups", { outputDirectory }),
   getBackupSettings: backupSettings.load,
   saveBackupSettings: backupSettings.save,
   pageCaptureStatus: () => invoke<CaptureStatus>("page_capture_status"),
+  openProgressWindow: () => invoke<void>("open_progress_window"),
   stopPageCapture: () => invoke<void>("stop_page_capture"),
   openCaptureDirectory: () => invoke<void>("open_capture_directory"),
   previewCaptureLayout: (setup: { handle: string; processId: number; portrait: boolean }) => invoke<CapturePreview>("preview_capture_layout", { setup }),
