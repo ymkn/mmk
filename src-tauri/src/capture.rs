@@ -9,10 +9,10 @@ use std::{
     io::BufWriter,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::Manager;
 
@@ -394,25 +394,14 @@ impl CaptureManager {
                         if let Some(handle) = previous_handle {
                             platform::check_foreground(handle)?;
                         }
-                        let window =
-                            open_fresh_batch_reader(&manager, &app, &book.asin, options.portrait)?;
-                        manager.trace(
-                            "window_ready",
-                            json!({"width":window.width, "height":window.height}),
-                        );
-                        let handle = super::capture_reader_handle(&app)
-                            .ok_or("内蔵リーダーのウィンドウを取得できません")?;
-                        let reader = app
-                            .get_webview_window(super::CAPTURE_READER_LABEL)
-                            .ok_or("内蔵リーダーが閉じられました")?;
-                        previous_handle = Some(handle);
-                        wait_for_batch_reader(
+                        let (handle, reader) = open_batch_reader_with_retry(
                             &manager,
-                            &reader,
+                            &app,
                             &book.asin,
-                            handle,
                             options.portrait,
+                            previous_handle,
                         )?;
+                        previous_handle = Some(handle);
                         let mut single = options.for_book(book);
                         single.handle = handle.to_string();
                         let target = platform::Target::new(&single, Some(handle))?;
@@ -716,6 +705,155 @@ fn open_fresh_batch_reader(
     })
 }
 
+// Opening a book intermittently lands on Amazon's error page or never
+// finishes loading, even though the same book opens fine moments later.
+// Retry the open a few times with a cooldown instead of aborting the whole
+// batch on the first failure; if every attempt fails, the batch still stops.
+const READER_OPEN_MAX_ATTEMPTS: usize = 5;
+const READER_OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+const READER_OPEN_RETRY_COOLDOWN: Duration = Duration::from_secs(180);
+const READER_OPEN_RETRY_COOLDOWN_JITTER_MS: u64 = 30_000;
+
+// A small xorshift64* generator is enough to vary the retry cooldown. It is
+// not used for anything security related. The multiply-high range mapping
+// is near-uniform; any residual bias is irrelevant for a pause length.
+struct RetryRng(u64);
+
+impl RetryRng {
+    fn new() -> Self {
+        static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let seed = nanos
+            ^ (u64::from(std::process::id()) << 32)
+            ^ SEED_COUNTER
+                .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::SeqCst)
+                .wrapping_mul(0x2545_F491_4F6C_DD1D);
+        // xorshift cannot run from a zero state.
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    // A value in [0, span): used to stretch the cooldown by up to span ms.
+    fn below(&mut self, span_ms: u64) -> u64 {
+        if span_ms == 0 {
+            return 0;
+        }
+        ((u128::from(self.next_u64()) * u128::from(span_ms)) >> 64) as u64
+    }
+}
+
+fn reader_open_should_retry(attempt: usize, outcome: ReaderWaitOutcome) -> bool {
+    outcome != ReaderWaitOutcome::Ready && attempt < READER_OPEN_MAX_ATTEMPTS
+}
+
+enum ReaderOpenAttempt<T> {
+    Opened(T),
+    Failed(ReaderWaitOutcome),
+}
+
+// Sequencing for the retry loop: run attempts until one opens, run the
+// cooldown hook before each retry, and give up with the last outcome once
+// the attempt limit is reached. Errors from either closure abort at once;
+// the outer Result carries those, the inner one the exhausted outcome.
+fn drive_reader_open_retries<T>(
+    mut try_open: impl FnMut() -> Result<ReaderOpenAttempt<T>, String>,
+    mut before_retry: impl FnMut(usize, ReaderWaitOutcome) -> Result<(), String>,
+) -> Result<Result<T, ReaderWaitOutcome>, String> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match try_open()? {
+            ReaderOpenAttempt::Opened(value) => return Ok(Ok(value)),
+            ReaderOpenAttempt::Failed(outcome) => {
+                if !reader_open_should_retry(attempt, outcome) {
+                    return Ok(Err(outcome));
+                }
+                before_retry(attempt, outcome)?;
+            }
+        }
+    }
+}
+
+fn open_batch_reader_with_retry(
+    manager: &CaptureManager,
+    app: &tauri::AppHandle,
+    asin: &str,
+    portrait: bool,
+    previous_handle: Option<usize>,
+) -> Result<(usize, tauri::WebviewWindow), String> {
+    let mut rng = RetryRng::new();
+    // The handle to guard before reopening is the latest attempt's own
+    // reader, not the previous book's (that window is already closed). The
+    // first attempt skips the guard: the caller already checked the
+    // previous book's foreground state.
+    let mut last_handle = previous_handle;
+    let mut attempts_started = 0usize;
+    let opened = drive_reader_open_retries(
+        || {
+            attempts_started += 1;
+            if attempts_started > 1 {
+                if let Some(handle) = last_handle {
+                    platform::check_foreground(handle)?;
+                }
+            }
+            let window = open_fresh_batch_reader(manager, app, asin, portrait)?;
+            manager.trace(
+                "window_ready",
+                json!({"width":window.width, "height":window.height}),
+            );
+            let handle = super::capture_reader_handle(app)
+                .ok_or("内蔵リーダーのウィンドウを取得できません")?;
+            let reader = app
+                .get_webview_window(super::CAPTURE_READER_LABEL)
+                .ok_or("内蔵リーダーが閉じられました")?;
+            last_handle = Some(handle);
+            match wait_for_batch_reader(manager, &reader, asin, handle, portrait)? {
+                ReaderWaitOutcome::Ready => Ok(ReaderOpenAttempt::Opened((handle, reader))),
+                outcome => Ok(ReaderOpenAttempt::Failed(outcome)),
+            }
+        },
+        |attempt, outcome| {
+            manager.trace(
+                "reader_open_retry",
+                json!({"attempt":attempt, "reason":outcome.reason()}),
+            );
+            let cooldown = READER_OPEN_RETRY_COOLDOWN
+                + Duration::from_millis(rng.below(READER_OPEN_RETRY_COOLDOWN_JITTER_MS + 1));
+            if let Ok(mut status) = manager.status.lock() {
+                status.message = format!(
+                    "本を開けなかったため、約3分待ってから開き直します（再試行 {attempt}/{}）",
+                    READER_OPEN_MAX_ATTEMPTS - 1
+                );
+            }
+            wait(manager, cooldown)
+        },
+    )?;
+    match opened {
+        Ok(value) => Ok(value),
+        Err(ReaderWaitOutcome::ErrorPage) => Err(format!(
+            "Amazonのエラーページが表示され、{READER_OPEN_MAX_ATTEMPTS}回試しても本を開けませんでした"
+        )),
+        Err(_) => Err(format!(
+            "本文の読み込みが{READER_OPEN_MAX_ATTEMPTS}回試しても完了しませんでした。ログイン・通信・読書可否を確認してください"
+        )),
+    }
+}
+
 fn wait_for_reader_closed(
     manager: &CaptureManager,
     timeout: Duration,
@@ -735,52 +873,161 @@ fn wait_for_reader_closed(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaderWaitOutcome {
+    Ready,
+    TimedOut,
+    ErrorPage,
+}
+
+impl ReaderWaitOutcome {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::TimedOut => "timeout",
+            Self::ErrorPage => "error_page",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReaderPoll {
+    prompt_dismissed: bool,
+    ready: bool,
+    error_page: bool,
+}
+
+// Do not mistake a transient evaluation failure (the WebView is mid
+// navigation and cannot answer yet) for a dead reader; only a run of
+// consecutive failures is reported.
+const READER_POLL_MAX_CONSECUTIVE_ERRORS: usize = 3;
+const READER_ERROR_PAGE_GRACE: Duration = Duration::from_secs(3);
+
+fn wait_for_batch_reader_with(
+    timeout: Duration,
+    error_page_grace: Duration,
+    mut poll: impl FnMut() -> Result<ReaderPoll, String>,
+    mut pause: impl FnMut() -> Result<(), String>,
+    mut state_log: impl FnMut(bool, u64),
+    mut poll_error_log: impl FnMut(usize),
+) -> Result<ReaderWaitOutcome, String> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut next_log = Instant::now();
+    let mut ready_count = 0usize;
+    let mut consecutive_errors = 0usize;
+    while Instant::now() < deadline {
+        pause()?;
+        let observation = match poll() {
+            Ok(observation) => {
+                consecutive_errors = 0;
+                observation
+            }
+            Err(error) => {
+                // A gap in observation breaks the "consecutive ready" run.
+                ready_count = 0;
+                consecutive_errors += 1;
+                poll_error_log(consecutive_errors);
+                if consecutive_errors > READER_POLL_MAX_CONSECUTIVE_ERRORS {
+                    return Err(error);
+                }
+                continue;
+            }
+        };
+        if Instant::now() >= deadline {
+            break;
+        }
+        if observation.prompt_dismissed {
+            ready_count = 0;
+            continue;
+        }
+        if observation.error_page && started.elapsed() >= error_page_grace {
+            return Ok(ReaderWaitOutcome::ErrorPage);
+        }
+        if Instant::now() >= next_log {
+            state_log(observation.ready, started.elapsed().as_millis() as u64);
+            next_log = Instant::now() + Duration::from_secs(2);
+        }
+        if observation.ready {
+            ready_count += 1;
+            if ready_count >= 2 {
+                return Ok(ReaderWaitOutcome::Ready);
+            }
+        } else {
+            ready_count = 0;
+        }
+    }
+    Ok(ReaderWaitOutcome::TimedOut)
+}
+
 fn wait_for_batch_reader(
     manager: &CaptureManager,
     reader: &tauri::WebviewWindow,
     asin: &str,
     handle: usize,
     single_page: bool,
-) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(90);
+) -> Result<ReaderWaitOutcome, String> {
     let started = Instant::now();
-    manager.trace("reader_wait_started", json!({"timeoutMs":90_000}));
-    let mut next_log = Instant::now();
-    let mut ready_count = 0;
-    while Instant::now() < deadline {
-        wait(manager, Duration::from_millis(500))?;
-        platform::check_foreground(handle)?;
-        if capture_layout::decline_resume_prompt(reader)? {
-            ready_count = 0;
-            continue;
-        }
-        // Check the loaded document, not only the navigation URL (which may update first).
-        let ready = capture_layout::reader_ready(reader, asin, single_page)?;
-        if Instant::now() >= next_log {
+    manager.trace(
+        "reader_wait_started",
+        json!({"timeoutMs":READER_OPEN_ATTEMPT_TIMEOUT.as_millis() as u64}),
+    );
+    let last_page_state = std::cell::Cell::new(capture_layout::ReaderPageState::Unknown);
+    let outcome = wait_for_batch_reader_with(
+        READER_OPEN_ATTEMPT_TIMEOUT,
+        READER_ERROR_PAGE_GRACE,
+        || {
+            if capture_layout::decline_resume_prompt(reader)? {
+                return Ok(ReaderPoll {
+                    prompt_dismissed: true,
+                    ..Default::default()
+                });
+            }
+            // Check the loaded document, not only the navigation URL (which may update first).
+            let ready = capture_layout::reader_ready(reader, asin, single_page)?;
+            let page_state = capture_layout::reader_page_state(reader)?;
+            last_page_state.set(page_state);
+            Ok(ReaderPoll {
+                prompt_dismissed: false,
+                ready,
+                error_page: page_state == capture_layout::ReaderPageState::AmazonError,
+            })
+        },
+        // Cancellation and foreground loss are hard stops: they ride on the
+        // pause, whose errors propagate immediately, instead of the poll,
+        // whose transient evaluation errors are tolerated.
+        || {
+            wait(manager, Duration::from_millis(500))?;
+            platform::check_foreground(handle)
+        },
+        |ready, elapsed_ms| {
             manager.trace(
                 "reader_wait_state",
-                json!({"ready":ready, "elapsedMs":started.elapsed().as_millis() as u64}),
+                json!({"ready":ready, "elapsedMs":elapsed_ms, "pageState":last_page_state.get().name()}),
             );
-            next_log = Instant::now() + Duration::from_secs(2);
-        }
-        if ready {
-            ready_count += 1;
-            if ready_count >= 2 {
-                manager.trace(
-                    "reader_wait_finished",
-                    json!({"durationMs":started.elapsed().as_millis() as u64}),
-                );
-                return Ok(());
-            }
-        } else {
-            ready_count = 0;
-        }
+        },
+        |consecutive| {
+            manager.trace(
+                "reader_poll_error",
+                json!({"consecutive":consecutive}),
+            );
+        },
+    )?;
+    match outcome {
+        ReaderWaitOutcome::Ready => manager.trace(
+            "reader_wait_finished",
+            json!({"durationMs":started.elapsed().as_millis() as u64}),
+        ),
+        ReaderWaitOutcome::TimedOut => manager.trace(
+            "reader_wait_timeout",
+            json!({"timeoutMs":READER_OPEN_ATTEMPT_TIMEOUT.as_millis() as u64, "pageState":last_page_state.get().name()}),
+        ),
+        ReaderWaitOutcome::ErrorPage => manager.trace(
+            "reader_error_page",
+            json!({"pageState":last_page_state.get().name()}),
+        ),
     }
-    manager.trace("reader_wait_timeout", json!({"timeoutMs":90_000}));
-    Err(
-        "本文の読み込みが90秒以内に完了しませんでした。ログイン・通信・読書可否を確認してください"
-            .into(),
-    )
+    Ok(outcome)
 }
 
 struct Frame {
@@ -3633,5 +3880,250 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("手動で停止"));
         assert_eq!(toggles.get(), 1);
+    }
+    fn scripted_reader_wait(
+        script: Vec<Result<ReaderPoll, String>>,
+        timeout: Duration,
+    ) -> Result<ReaderWaitOutcome, String> {
+        scripted_reader_wait_with_grace(script, timeout, Duration::ZERO)
+    }
+    fn scripted_reader_wait_with_grace(
+        script: Vec<Result<ReaderPoll, String>>,
+        timeout: Duration,
+        grace: Duration,
+    ) -> Result<ReaderWaitOutcome, String> {
+        let mut steps = script.into_iter();
+        wait_for_batch_reader_with(
+            timeout,
+            grace,
+            move || steps.next().unwrap_or(Ok(ReaderPoll::default())),
+            || {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(())
+            },
+            |_, _| {},
+            |_| {},
+        )
+    }
+    #[test]
+    fn reader_wait_needs_two_consecutive_ready_polls() {
+        let ready = ReaderPoll {
+            ready: true,
+            ..Default::default()
+        };
+        let outcome = scripted_reader_wait(
+            vec![Ok(ready), Ok(ReaderPoll::default()), Ok(ready), Ok(ready)],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::Ready);
+    }
+    #[test]
+    fn reader_wait_prompt_dismissal_resets_ready_count() {
+        let ready = ReaderPoll {
+            ready: true,
+            ..Default::default()
+        };
+        let prompt = ReaderPoll {
+            prompt_dismissed: true,
+            ..Default::default()
+        };
+        let outcome = scripted_reader_wait(
+            vec![Ok(ready), Ok(prompt), Ok(ready), Ok(ready)],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::Ready);
+    }
+    #[test]
+    fn reader_wait_reports_error_page_without_waiting_for_timeout() {
+        let error_page = ReaderPoll {
+            error_page: true,
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let outcome =
+            scripted_reader_wait(vec![Ok(error_page)], Duration::from_secs(30)).unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::ErrorPage);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    #[test]
+    fn reader_wait_times_out_when_never_ready() {
+        let outcome = scripted_reader_wait(vec![], Duration::from_millis(60)).unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::TimedOut);
+    }
+    #[test]
+    fn reader_wait_tolerates_transient_poll_errors_only() {
+        let ready = ReaderPoll {
+            ready: true,
+            ..Default::default()
+        };
+        let outcome = scripted_reader_wait(
+            vec![
+                Err("eval".into()),
+                Err("eval".into()),
+                Ok(ready),
+                Ok(ready),
+            ],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::Ready);
+        let failure = scripted_reader_wait(
+            vec![
+                Err("eval".into()),
+                Err("eval".into()),
+                Err("eval".into()),
+                Err("eval".into()),
+            ],
+            Duration::from_secs(5),
+        );
+        assert!(failure.is_err());
+    }
+    #[test]
+    fn reader_wait_poll_error_resets_ready_count() {
+        let ready = ReaderPoll {
+            ready: true,
+            ..Default::default()
+        };
+        // Without the reset, ready -> error -> ready would count as two
+        // consecutive ready polls and finish; it must time out instead.
+        let outcome = scripted_reader_wait(
+            vec![Ok(ready), Err("eval".into()), Ok(ready)],
+            Duration::from_millis(80),
+        )
+        .unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::TimedOut);
+    }
+    #[test]
+    fn reader_wait_error_page_respects_grace_period() {
+        let started = Instant::now();
+        let error_page = ReaderPoll {
+            error_page: true,
+            ..Default::default()
+        };
+        let mut steps = vec![Ok(error_page)].into_iter().cycle();
+        let outcome = wait_for_batch_reader_with(
+            Duration::from_secs(10),
+            Duration::from_millis(150),
+            move || steps.next().unwrap(),
+            || {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            },
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::ErrorPage);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    #[test]
+    fn reader_wait_slow_poll_past_deadline_times_out() {
+        let ready = ReaderPoll {
+            ready: true,
+            ..Default::default()
+        };
+        let outcome = wait_for_batch_reader_with(
+            Duration::from_millis(40),
+            Duration::ZERO,
+            move || {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(ready)
+            },
+            || Ok(()),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome, ReaderWaitOutcome::TimedOut);
+    }
+    #[test]
+    fn reader_open_driver_retries_until_opened() {
+        let mut script = vec![
+            ReaderOpenAttempt::Failed(ReaderWaitOutcome::TimedOut),
+            ReaderOpenAttempt::Failed(ReaderWaitOutcome::ErrorPage),
+            ReaderOpenAttempt::Opened(7),
+        ]
+        .into_iter();
+        let mut retries = Vec::new();
+        let result = drive_reader_open_retries(
+            || Ok(script.next().unwrap()),
+            |attempt, outcome| {
+                retries.push((attempt, outcome));
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(
+            retries,
+            vec![
+                (1, ReaderWaitOutcome::TimedOut),
+                (2, ReaderWaitOutcome::ErrorPage)
+            ]
+        );
+    }
+    #[test]
+    fn reader_open_driver_gives_up_after_max_attempts() {
+        let mut attempts = 0usize;
+        let mut retries = 0usize;
+        let result = drive_reader_open_retries(
+            || {
+                attempts += 1;
+                Ok(ReaderOpenAttempt::<()>::Failed(ReaderWaitOutcome::TimedOut))
+            },
+            |_, _| {
+                retries += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Err(ReaderWaitOutcome::TimedOut));
+        assert_eq!(attempts, READER_OPEN_MAX_ATTEMPTS);
+        assert_eq!(retries, READER_OPEN_MAX_ATTEMPTS - 1);
+    }
+    #[test]
+    fn reader_open_driver_propagates_hard_errors() {
+        let failure = drive_reader_open_retries(
+            || Err::<ReaderOpenAttempt<()>, String>("open failed".into()),
+            |_, _| Ok(()),
+        );
+        assert!(failure.is_err());
+        let mut attempts = 0usize;
+        let cancelled = drive_reader_open_retries(
+            || {
+                attempts += 1;
+                Ok(ReaderOpenAttempt::<()>::Failed(ReaderWaitOutcome::TimedOut))
+            },
+            |_, _| Err("手動で停止しました".to_owned()),
+        );
+        assert!(cancelled.is_err());
+        assert_eq!(attempts, 1);
+    }
+    #[test]
+    fn reader_open_retries_only_failed_attempts_within_limit() {
+        assert!(reader_open_should_retry(1, ReaderWaitOutcome::TimedOut));
+        assert!(reader_open_should_retry(1, ReaderWaitOutcome::ErrorPage));
+        assert!(reader_open_should_retry(
+            READER_OPEN_MAX_ATTEMPTS - 1,
+            ReaderWaitOutcome::TimedOut
+        ));
+        assert!(!reader_open_should_retry(
+            READER_OPEN_MAX_ATTEMPTS,
+            ReaderWaitOutcome::TimedOut
+        ));
+        assert!(!reader_open_should_retry(1, ReaderWaitOutcome::Ready));
+    }
+    #[test]
+    fn retry_rng_below_stays_in_range() {
+        let mut rng = RetryRng::new();
+        for _ in 0..100 {
+            assert!(rng.below(10_001) <= 10_000);
+        }
+        assert_eq!(rng.below(0), 0);
+        assert_eq!(rng.below(1), 0);
     }
 }
