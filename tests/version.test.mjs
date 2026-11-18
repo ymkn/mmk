@@ -17,7 +17,9 @@ test('package, Tauri and Rust versions agree', () => {
 });
 
 function fixture(t) {
-  const dir = mkdtempSync(join(process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir(), 'mmk-version-'));
+  const base = process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : tmpdir();
+  mkdirSync(base, { recursive: true });
+  const dir = mkdtempSync(join(base, 'mmk-version-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   mkdirSync(join(dir, 'src-tauri'));
   const root = pathToFileURL(`${dir}/`);
