@@ -9,6 +9,16 @@ pub enum PageLayout {
     Spread,
 }
 
+/// Which capture engine batch backups use. Single-book capture always
+/// uses the web reader regardless of this setting.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupEngine {
+    Web,
+    #[default]
+    Desktop,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BackupSettings {
@@ -16,6 +26,9 @@ pub struct BackupSettings {
     pub max_pages: u32,
     pub page_layout: PageLayout,
     pub key: String,
+    pub engine: BackupEngine,
+    /// Path to ShotAndPackKindle.exe for the desktop engine (file-only).
+    pub desktop_tool_path: String,
 }
 
 impl Default for BackupSettings {
@@ -25,6 +38,8 @@ impl Default for BackupSettings {
             max_pages: 1000,
             page_layout: PageLayout::Single,
             key: "left".into(),
+            engine: BackupEngine::Web,
+            desktop_tool_path: String::new(),
         }
     }
 }
@@ -101,6 +116,15 @@ pub fn save(path: &Path, settings: &BackupSettings) -> Result<(), String> {
 pub fn update_visible_settings(path: &Path, page_layout: PageLayout) -> Result<(), String> {
     let mut current = load(path)?;
     current.page_layout = page_layout;
+    save(path, &current)
+}
+
+/// Update both user-visible settings in one load/save transaction so a
+/// failure never persists only half of the change.
+pub fn update_visible(path: &Path, page_layout: PageLayout, engine: BackupEngine) -> Result<(), String> {
+    let mut current = load(path)?;
+    current.page_layout = page_layout;
+    current.engine = engine;
     save(path, &current)
 }
 

@@ -678,13 +678,14 @@ fn get_backup_settings(
         .map_err(|e| e.to_string())?
         .join("backup-settings.json");
     let settings = backup_settings::load(&path)?;
-    Ok(serde_json::json!({ "pageLayout": settings.page_layout, "configPath": path }))
+    Ok(serde_json::json!({ "pageLayout": settings.page_layout, "engine": settings.engine, "configPath": path }))
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BackupSettingsInput {
     page_layout: backup_settings::PageLayout,
+    engine: backup_settings::BackupEngine,
 }
 
 #[tauri::command]
@@ -699,7 +700,7 @@ fn save_backup_settings(
         .app_config_dir()
         .map_err(|e| e.to_string())?
         .join("backup-settings.json");
-    backup_settings::update_visible_settings(&path, settings.page_layout)
+    backup_settings::update_visible(&path, settings.page_layout, settings.engine)
 }
 
 #[derive(serde::Deserialize)]
@@ -804,6 +805,33 @@ fn start_batch_capture(
             series_name: book.effective_series_name,
         });
     }
+    if settings.engine == backup_settings::BackupEngine::Desktop {
+        let tool_path = settings.desktop_tool_path.trim();
+        if tool_path.is_empty() {
+            return Err("デスクトップ方式のツールパスが未設定です。設定ファイル（backup-settings.json）の desktopToolPath に ShotAndPackKindle.exe のパスを設定してください".into());
+        }
+        let tool = std::path::PathBuf::from(tool_path);
+        if !tool.is_file() {
+            return Err(format!(
+                "デスクトップ撮影ツールが見つかりません: {}",
+                tool.display()
+            ));
+        }
+        let probe = std::process::Command::new(&tool)
+            .arg("--check")
+            .output()
+            .map_err(|e| format!("デスクトップ撮影ツールを起動できません: {e}"))?;
+        let report: serde_json::Value =
+            serde_json::from_slice(&probe.stdout).unwrap_or(serde_json::Value::Null);
+        if !probe.status.success() || report.get("protocol").and_then(|v| v.as_u64()) != Some(1) {
+            return Err("デスクトップ撮影ツールのバージョンが適合しません（protocol 1 が必要です）".into());
+        }
+        if report.get("allowLaunch").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("デスクトップ撮影ツールが旧版です（バッチ中のアプリ再起動を抑止できる版が必要です）".into());
+        }
+        let root = backup_root(&app, &options.output_directory)?;
+        return manager.start_batch_desktop(books, root, tool, settings.max_pages);
+    }
     let directory = app
         .path()
         .picture_dir()
@@ -817,8 +845,194 @@ fn page_capture_status(
     window: WebviewWindow,
     manager: State<'_, capture::CaptureManager>,
 ) -> Result<capture::CaptureStatus, String> {
-    require_main(&window)?;
+    require_main_or_progress(&window)?;
     manager.status()
+}
+
+const PROGRESS_WINDOW_LABEL: &str = "progress";
+
+fn require_main_or_progress(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() == "main" || window.label() == PROGRESS_WINDOW_LABEL {
+        Ok(())
+    } else {
+        Err("この操作はメイン画面または進捗画面からのみ実行できます".to_owned())
+    }
+}
+
+fn progress_window_position_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("progress-window-position.txt"))
+        .map_err(|error| error.to_string())
+}
+
+fn load_progress_window_position(app: &tauri::AppHandle) -> Option<tauri::PhysicalPosition<i32>> {
+    let path = progress_window_position_path(app).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let (x, y) = text.trim().split_once(',')?;
+    Some(tauri::PhysicalPosition::new(x.parse().ok()?, y.parse().ok()?))
+}
+
+fn save_progress_window_position(app: &tauri::AppHandle, position: tauri::PhysicalPosition<i32>) {
+    let Ok(path) = progress_window_position_path(app) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 途中終了で位置ファイルが壊れないよう、一時ファイル経由で置き換える。
+    // 置換に失敗する環境向けに、既存を消してから再試行するフォールバック付き。
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, format!("{},{}", position.x, position.y)).is_ok()
+        && std::fs::rename(&temp, &path).is_err()
+    {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::rename(&temp, &path);
+    }
+}
+
+fn progress_window_target_position(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    let monitors = window.available_monitors().ok()?;
+    let outer = window.outer_size().ok()?;
+    // ウィンドウ全体がモニターの作業領域に収まるよう左上をクランプする。
+    let clamp_into = |position: tauri::PhysicalPosition<i32>,
+                      monitor: &tauri::Monitor|
+     -> tauri::PhysicalPosition<i32> {
+        let area = monitor.work_area();
+        let max_x = area.position.x + area.size.width as i32 - outer.width as i32;
+        let max_y = area.position.y + area.size.height as i32 - outer.height as i32;
+        tauri::PhysicalPosition::new(
+            position.x.clamp(area.position.x, max_x.max(area.position.x)),
+            position.y.clamp(area.position.y, max_y.max(area.position.y)),
+        )
+    };
+    if let Some(saved) = load_progress_window_position(app) {
+        let host = monitors.iter().find(|monitor| {
+            let origin = monitor.position();
+            let size = monitor.size();
+            saved.x >= origin.x
+                && saved.y >= origin.y
+                && saved.x < origin.x + size.width as i32
+                && saved.y < origin.y + size.height as i32
+        });
+        if let Some(monitor) = host {
+            return Some(clamp_into(saved, monitor));
+        }
+    }
+    // 初回は、あればセカンダリモニターの左上に置く。メインモニターは
+    // バックアップ中に Kindle アプリが全画面で使うため。
+    let primary = window.primary_monitor().ok()??;
+    let secondary = monitors
+        .iter()
+        .find(|monitor| monitor.position() != primary.position())?;
+    let origin = secondary.position();
+    Some(clamp_into(
+        tauri::PhysicalPosition::new(origin.x + 24, origin.y + 24),
+        secondary,
+    ))
+}
+
+#[tauri::command]
+async fn open_progress_window(window: WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    require_main(&window)?;
+    // 自動表示と手動表示の同時実行で生成・表示が競合しないよう直列化する。
+    static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _open_guard = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = app.get_webview_window(PROGRESS_WINDOW_LABEL) {
+        let _ = existing.unminimize();
+        if existing.show().is_ok() {
+            // モニター切断などで画面外に残っていたら、収まる位置へ寄せる。
+            let off_screen = match (existing.outer_position(), existing.available_monitors()) {
+                (Ok(position), Ok(monitors)) => !monitors.iter().any(|monitor| {
+                    let origin = monitor.position();
+                    let size = monitor.size();
+                    position.x >= origin.x
+                        && position.y >= origin.y
+                        && position.x < origin.x + size.width as i32
+                        && position.y < origin.y + size.height as i32
+                }),
+                _ => false,
+            };
+            if off_screen {
+                if let Some(target) = progress_window_target_position(&app, &existing) {
+                    let _ = existing.set_position(target);
+                }
+            }
+            return Ok(());
+        }
+        // 閉じかけで表示できなかった場合は、新規作成へフォールバックする。
+        let _ = existing.close();
+    }
+    let progress_window = match WebviewWindowBuilder::new(
+        &app,
+        PROGRESS_WINDOW_LABEL,
+        WebviewUrl::App("index.html?view=progress".into()),
+    )
+    .title("バックアップ進捗")
+    .inner_size(400.0, 240.0)
+    .resizable(false)
+    .always_on_top(true)
+    .focused(false)
+    .visible(false)
+    .build()
+    {
+        Ok(window) => window,
+        Err(error) => {
+            // 自動表示と手動表示が競合して同ラベルが既に作られていた場合は、
+            // そちらを表示して成功扱いにする。
+            if let Some(existing) = app.get_webview_window(PROGRESS_WINDOW_LABEL) {
+                let _ = existing.unminimize();
+                existing.show().map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+    };
+    if let Some(position) = progress_window_target_position(&app, &progress_window) {
+        let _ = progress_window.set_position(position);
+    }
+    // 位置が決まってから表示する（既定モニターに一瞬出てから移動するのを防ぐ）。
+    progress_window.show().map_err(|error| error.to_string())?;
+    // メインウィンドウが閉じたら進捗ウィンドウも閉じ、プロセスが
+    // 進捗ウィンドウだけを残して生き続けないようにする。
+    if let Some(main) = app.get_webview_window("main") {
+        let progress_for_hook = progress_window.clone();
+        main.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let _ = progress_for_hook.close();
+            }
+        });
+    }
+    let handle = app.clone();
+    let event_window = progress_window.clone();
+    let last_saved = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    progress_window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Moved(position) => {
+            let should_save = {
+                let mut last = last_saved.lock().unwrap();
+                match *last {
+                    Some(at) if at.elapsed() < std::time::Duration::from_millis(300) => false,
+                    _ => {
+                        *last = Some(std::time::Instant::now());
+                        true
+                    }
+                }
+            };
+            if should_save {
+                save_progress_window_position(&handle, *position);
+            }
+        }
+        tauri::WindowEvent::CloseRequested { .. } => {
+            if let Ok(position) = event_window.outer_position() {
+                save_progress_window_position(&handle, position);
+            }
+        }
+        _ => {}
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -968,6 +1182,7 @@ pub fn run() {
             start_page_capture,
             start_batch_capture,
             page_capture_status,
+            open_progress_window,
             stop_page_capture,
             open_capture_directory,
             preview_capture_layout,

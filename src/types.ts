@@ -44,11 +44,14 @@ export interface CaptureStatus {
   totalBooks: number;
   completedBooks: number;
   skippedBooks: number;
+  failedBooks: number;
+  failedTitles: string[];
   currentTitle: string;
   currentPosition: number | null;
   totalPositions: number | null;
   logPath: string | null;
   logError: string | null;
+  progressUpdatedAt: number | null;
 }
 
 export interface BatchCaptureOptions {
@@ -58,6 +61,7 @@ export interface BatchCaptureOptions {
 
 export interface BackupSettings {
   pageLayout: "single" | "spread";
+  engine: "web" | "desktop";
   configPath: string;
 }
 

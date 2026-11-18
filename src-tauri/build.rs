@@ -26,6 +26,7 @@ fn main() {
             "start_page_capture",
             "start_batch_capture",
             "page_capture_status",
+            "open_progress_window",
             "stop_page_capture",
             "open_capture_directory",
             "preview_capture_layout",

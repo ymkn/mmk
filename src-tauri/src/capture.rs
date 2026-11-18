@@ -175,11 +175,17 @@ pub struct CaptureStatus {
     pub total_books: usize,
     pub completed_books: usize,
     pub skipped_books: usize,
+    pub failed_books: usize,
+    pub failed_titles: Vec<String>,
     pub current_title: String,
     pub current_position: Option<u32>,
     pub total_positions: Option<u32>,
     pub log_path: Option<String>,
     pub log_error: Option<String>,
+    /// 進捗キー（完了/スキップ/失敗冊数・保存ページ数・現在の冊・位置）が
+    /// 最後に変化した時刻（Unix ミリ秒）。CaptureManager::status() が観測して
+    /// 付けるため、構築側は None のままでよい。進捗ウィンドウの停滞判定用。
+    pub progress_updated_at: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -187,6 +193,7 @@ pub struct CaptureManager {
     status: Arc<Mutex<CaptureStatus>>,
     cancel: Arc<AtomicBool>,
     log: Arc<Mutex<capture_log::CaptureLog>>,
+    progress_stamp: Arc<Mutex<Option<(String, std::time::SystemTime)>>>,
 }
 
 impl CaptureManager {
@@ -199,6 +206,32 @@ impl CaptureManager {
         if let Ok(log) = self.log.lock() {
             status.log_path = log.path();
             status.log_error = log.error();
+        }
+        // 進捗キーの変化を観測して最終変化時刻を付ける。ポーリング間隔の
+        // 範囲でしか観測できないが、進捗ウィンドウ表示中は毎秒呼ばれる。
+        let progress_key = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            status.running,
+            status.completed_books,
+            status.skipped_books,
+            status.failed_books,
+            status.saved_pages,
+            status.current_title,
+            status.current_position.map(|p| p.to_string()).unwrap_or_default(),
+        );
+        if let Ok(mut stamp) = self.progress_stamp.lock() {
+            let changed = stamp
+                .as_ref()
+                .map(|(key, _)| key != &progress_key)
+                .unwrap_or(true);
+            if changed {
+                *stamp = Some((progress_key, std::time::SystemTime::now()));
+            }
+            status.progress_updated_at = stamp.as_ref().and_then(|(_, at)| {
+                at.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as i64)
+            });
         }
         Ok(status)
     }
@@ -389,37 +422,54 @@ impl CaptureManager {
                     let _awake = platform::KeepAwake::new()?;
                     let mut previous_handle = None;
                     run_batch(&manager, &books, &root, |book, directory| {
-                        // Do not steal focus back if the user interrupted between books.
-                        wait(&manager, Duration::ZERO)?;
-                        if let Some(handle) = previous_handle {
-                            platform::check_foreground(handle)?;
+                        // A failed attempt may have closed the shared reader
+                        // window; forget its handle so a retry (or the next
+                        // book) opens a fresh reader instead of failing on
+                        // the stale handle forever.
+                        let result = (|| -> Result<CaptureEnd, String> {
+                            // Do not steal focus back if the user interrupted between books.
+                            wait(&manager, Duration::ZERO)?;
+                            if let Some(handle) = previous_handle {
+                                platform::check_foreground(handle)?;
+                            }
+                            let (handle, reader) = open_batch_reader_with_retry(
+                                &manager,
+                                &app,
+                                &book.asin,
+                                options.portrait,
+                                previous_handle,
+                            )?;
+                            previous_handle = Some(handle);
+                            let mut single = options.for_book(book);
+                            single.handle = handle.to_string();
+                            let target = platform::Target::new(&single, Some(handle))?;
+                            run(&manager, &single, &target, directory, Some(&reader))
+                        })();
+                        if result.is_err() {
+                            previous_handle = None;
                         }
-                        let (handle, reader) = open_batch_reader_with_retry(
-                            &manager,
-                            &app,
-                            &book.asin,
-                            options.portrait,
-                            previous_handle,
-                        )?;
-                        previous_handle = Some(handle);
-                        let mut single = options.for_book(book);
-                        single.handle = handle.to_string();
-                        let target = platform::Target::new(&single, Some(handle))?;
-                        run(&manager, &single, &target, directory, Some(&reader))
+                        result
                     })
                 }));
                 match &result {
-                    Ok(Ok(())) => manager.trace("run_finished", json!({"outcome":"completed"})),
+                    Ok(Ok(())) => {
+                        let failed = manager
+                            .status
+                            .lock()
+                            .map(|s| s.failed_books)
+                            .unwrap_or(0);
+                        manager.trace(
+                            "run_finished",
+                            json!({"outcome":if failed > 0 {"completed_with_failures"} else {"completed"}, "failedBooks":failed}),
+                        )
+                    }
                     Ok(Err(error)) => manager.trace_failure("batch_run", error),
                     Err(_) => manager.trace("run_panicked", json!({"stage":"batch_run"})),
                 }
                 if let Ok(mut status) = manager.status.lock() {
                     status.running = false;
                     status.message = match result {
-                        Ok(Ok(())) => format!(
-                            "一括バックアップ終了: 完了 {}冊・バックアップ済みスキップ {}冊",
-                            status.completed_books, status.skipped_books
-                        ),
+                        Ok(Ok(())) => batch_completion_message(&status),
                         Ok(Err(error)) => format!("一括バックアップ停止: {error}"),
                         Err(_) => "一括バックアップで予期しないエラーが発生しました".into(),
                     };
@@ -429,6 +479,109 @@ impl CaptureManager {
             self.trace_failure("spawn_worker", &error.to_string());
             status.running = false;
             status.message = format!("一括バックアップを開始できません: {error}");
+            return Err(status.message.clone());
+        }
+        Ok(())
+    }
+
+    /// Batch backup through the external desktop capture tool
+    /// (ShotAndPackKindle.exe), which drives the official Kindle desktop
+    /// app. Pages land in each book's work directory as JPEG files and are
+    /// published as mmk-backup-v2 archives by the shared batch runner.
+    pub fn start_batch_desktop(
+        &self,
+        books: Vec<BatchBook>,
+        root: PathBuf,
+        tool_path: PathBuf,
+        max_pages: u32,
+    ) -> Result<(), String> {
+        if books.is_empty() || books.len() > 10_000 {
+            return Err("バックアップ対象は1〜10000冊で指定してください".into());
+        }
+        for book in &books {
+            super::validate_asin(&book.asin)?;
+        }
+        let mut status = self.status.lock().map_err(|e| e.to_string())?;
+        if status.running {
+            return Err("すでにバックアップ処理を実行中です".into());
+        }
+        fs::create_dir_all(&root).map_err(|e| format!("保存先を作成できません: {e}"))?;
+        self.cancel.store(false, Ordering::SeqCst);
+        *status = CaptureStatus {
+            running: true,
+            batch: true,
+            total_books: books.len(),
+            output_directory: root.to_string_lossy().into_owned(),
+            message: "バックアップ済みデータを確認しています".into(),
+            ..Default::default()
+        };
+        self.begin_trace(json!({"mode": "batch-desktop", "books": books.len(), "maxPages": max_pages}));
+        // Only the first tool run of the batch may launch the Kindle app;
+        // later runs must find it already running (see capture_book_desktop).
+        let launch = std::sync::Arc::new(AtomicBool::new(true));
+        let manager = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("kindle-batch-desktop".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _awake = platform::KeepAwake::new()?;
+                    let launch = launch.clone();
+                    run_batch_with_format(
+                        &manager,
+                        &books,
+                        &root,
+                        capture_output::ArchiveFormat::JpegV2,
+                        |book, directory| {
+                            capture_book_desktop(
+                                &manager,
+                                book,
+                                directory,
+                                &tool_path,
+                                max_pages,
+                                &launch,
+                            )
+                        },
+                    )
+                }));
+                match &result {
+                    Ok(Ok(())) => {
+                        let failed = manager
+                            .status
+                            .lock()
+                            .map(|s| s.failed_books)
+                            .unwrap_or(0);
+                        manager.trace(
+                            "run_finished",
+                            json!({"outcome":if failed > 0 {"completed_with_failures"} else {"completed"}, "failedBooks":failed}),
+                        )
+                    }
+                    Ok(Err(error)) => manager.trace_failure("batch_run", error),
+                    Err(_) => manager.trace("run_panicked", json!({"stage": "batch_run"})),
+                }
+                // Per-book tool runs leave the Kindle app fullscreen so the
+                // next book reuses it; restore it once, here at batch end.
+                {
+                    use std::process::{Command, Stdio};
+                    let _ = Command::new(&tool_path)
+                        .arg("--exit-fullscreen")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                if let Ok(mut status) = manager.status.lock() {
+                    status.running = false;
+                    status.message = match result {
+                        Ok(Ok(())) => batch_completion_message(&status),
+                        Ok(Err(error)) => format!("一括バックアップ停止: {error}"),
+                        Err(_) => "一括バックアップで予期しないエラーが発生しました".into(),
+                    };
+                }
+            });
+        if let Err(error) = spawned {
+            self.trace_failure("spawn_worker", &error.to_string());
+            status.running = false;
+            status.message = format!("バックアップ処理を開始できません: {error}");
             return Err(status.message.clone());
         }
         Ok(())
@@ -592,11 +745,322 @@ fn has_capture_data(
     Ok(false)
 }
 
+/// Status file written by the desktop capture tool (protocol 1).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopToolStatus {
+    protocol: u32,
+    run_id: String,
+    asin: String,
+    state: String,
+    pages: u32,
+    current_location: Option<u32>,
+    total_locations: Option<u32>,
+    error: Option<String>,
+}
+
+fn read_desktop_status(path: &Path) -> Option<DesktopToolStatus> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Capture one book with the external desktop tool. The tool writes JPEG
+/// pages into the book's work directory; this function supervises the
+/// process, mirrors its progress into CaptureStatus, and only reports
+/// LastPage after verifying the status file and the page files on disk.
+/// Tool status-error tokens for "the Kindle app is unavailable". The tool
+/// reports these instead of (re)launching the app mid-batch; mmk turns
+/// them into a batch abort, because a (re)launched app's window state is
+/// unstable and poisons the following books.
+const APP_NOT_RUNNING_TOKEN: &str = "APP_NOT_RUNNING";
+const APP_START_FAILED_TOKEN: &str = "APP_START_FAILED";
+const APP_NOT_RUNNING_MESSAGE: &str =
+    "Kindleアプリが終了していたため、バッチを中断しました（アプリを起動してから再開してください）";
+const APP_START_FAILED_MESSAGE: &str =
+    "Kindleアプリを起動できなかったため、バッチを中断しました";
+
+/// Map a desktop tool failure detail to a batch-abort message when the
+/// failure is "the Kindle app is unavailable".
+fn app_unavailable_message(detail: &str) -> Option<&'static str> {
+    if detail.starts_with(APP_NOT_RUNNING_TOKEN) {
+        Some(APP_NOT_RUNNING_MESSAGE)
+    } else if detail.starts_with(APP_START_FAILED_TOKEN) {
+        Some(APP_START_FAILED_MESSAGE)
+    } else {
+        None
+    }
+}
+
+fn is_app_unavailable(error: &str) -> bool {
+    error == APP_NOT_RUNNING_MESSAGE || error == APP_START_FAILED_MESSAGE
+}
+
+fn capture_book_desktop(
+    manager: &CaptureManager,
+    book: &BatchBook,
+    directory: &Path,
+    tool_path: &Path,
+    max_pages: u32,
+    launch: &AtomicBool,
+) -> Result<CaptureEnd, String> {
+    use std::process::{Command, Stdio};
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let temp = std::env::temp_dir();
+    let manifest_path = temp.join(format!("mmk-desktop-{run_id}.json"));
+    let status_path = temp.join(format!("mmk-desktop-{run_id}-status.json"));
+    let log_path = temp.join(format!("mmk-desktop-{run_id}.log"));
+    let cleanup = |keep_log: bool| {
+        let _ = fs::remove_file(&manifest_path);
+        let _ = fs::remove_file(&status_path);
+        if !keep_log {
+            let _ = fs::remove_file(&log_path);
+        }
+    };
+    let allow_launch = launch.load(Ordering::SeqCst);
+    let manifest = json!({
+        "runId": run_id,
+        "allowLaunch": allow_launch,
+        "books": [{
+            "asin": book.asin,
+            "title": book.title,
+            "direction": "rtl",
+            "workDir": directory,
+            "maxPages": max_pages,
+        }],
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("デスクトップ撮影のマニフェストを作成できません: {e}"))?;
+
+    let mut child = Command::new(tool_path)
+        .arg("--mmk-manifest")
+        .arg(&manifest_path)
+        .arg("--status")
+        .arg(&status_path)
+        .arg("--log-file")
+        .arg(&log_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("デスクトップ撮影ツールを起動できません: {e}"))?;
+    // The batch's one app-launch permission is consumed only once the tool
+    // is actually running, so a manifest/spawn failure does not eat it.
+    launch.store(false, Ordering::SeqCst);
+
+    if let Ok(mut status) = manager.status.lock() {
+        status.message = "デスクトップアプリで撮影しています".into();
+    }
+    let exit = loop {
+        if manager.cancel.load(Ordering::SeqCst) || platform::escape_pressed() {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup(true);
+            return Err(if platform::escape_pressed() {
+                "Escキーで停止しました（保存済み画像は残ります）".into()
+            } else {
+                "手動で停止しました（保存済み画像は残ります）".into()
+            });
+        }
+        match child.try_wait() {
+            Ok(Some(exit)) => break exit,
+            Ok(None) => {
+                if let Some(tool) = read_desktop_status(&status_path) {
+                    if tool.run_id == run_id && tool.asin.eq_ignore_ascii_case(&book.asin) {
+                        if let Ok(mut status) = manager.status.lock() {
+                            status.saved_pages = tool.pages;
+                            status.current_position = tool.current_location;
+                            status.total_positions = tool.total_locations;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup(true);
+                return Err(format!("デスクトップ撮影ツールの状態を確認できません: {error}"));
+            }
+        }
+    };
+
+    // A cancel that raced with the child's exit still wins: never publish.
+    if manager.cancel.load(Ordering::SeqCst) {
+        cleanup(true);
+        return Err("手動で停止しました（保存済み画像は残ります）".into());
+    }
+    let tool = read_desktop_status(&status_path);
+    if !exit.success() {
+        let detail = tool
+            .as_ref()
+            .and_then(|t| t.error.clone())
+            .unwrap_or_else(|| format!("終了コード {:?}", exit.code()));
+        cleanup(true);
+        if let Some(message) = app_unavailable_message(&detail) {
+            return Err(message.into());
+        }
+        return Err(format!(
+            "デスクトップ撮影に失敗しました: {detail}（ログ: {}）",
+            log_path.display()
+        ));
+    }
+    let tool = tool.ok_or("デスクトップ撮影ツールの状態ファイルを読めません")?;
+    if tool.protocol != 1 || tool.run_id != run_id || !tool.asin.eq_ignore_ascii_case(&book.asin) {
+        cleanup(true);
+        return Err("デスクトップ撮影ツールの状態が一致しません".into());
+    }
+    if tool.state != "done" || tool.pages == 0 {
+        cleanup(true);
+        return Err(format!(
+            "デスクトップ撮影が完了状態ではありません: {}",
+            tool.error.clone().unwrap_or_else(|| tool.state.clone())
+        ));
+    }
+    capture_output::verify_pages(directory, tool.pages, capture_output::ArchiveFormat::JpegV2)?;
+    if let Ok(mut status) = manager.status.lock() {
+        status.saved_pages = tool.pages;
+        status.current_position = tool.total_locations;
+        status.total_positions = tool.total_locations;
+    }
+    manager.trace(
+        "desktop_tool_finished",
+        json!({"pages": tool.pages, "totalLocations": tool.total_locations}),
+    );
+    cleanup(false);
+    Ok(CaptureEnd::LastPage)
+}
+
+/// How many times a batch tries to capture one book before skipping it.
+const MAX_CAPTURE_ATTEMPTS: u32 = 3;
+/// Pause between capture attempts of the same book (cancel-aware).
+const CAPTURE_RETRY_WAIT: Duration = Duration::from_secs(60);
+
 fn run_batch(
     manager: &CaptureManager,
     books: &[BatchBook],
     root: &Path,
+    capture_book: impl FnMut(&BatchBook, &Path) -> Result<CaptureEnd, String>,
+) -> Result<(), String> {
+    run_batch_with_format(
+        manager,
+        books,
+        root,
+        capture_output::ArchiveFormat::PngV1,
+        capture_book,
+    )
+}
+
+fn run_batch_with_format(
+    manager: &CaptureManager,
+    books: &[BatchBook],
+    root: &Path,
+    format: capture_output::ArchiveFormat,
+    capture_book: impl FnMut(&BatchBook, &Path) -> Result<CaptureEnd, String>,
+) -> Result<(), String> {
+    run_batch_inner(
+        manager,
+        books,
+        root,
+        format,
+        capture_book,
+        CAPTURE_RETRY_WAIT,
+    )
+}
+
+/// True when an error means "the user stopped this": the cancel flag is
+/// set, Esc is currently pressed, or the error is one of the two cancel
+/// messages every capture path funnels through `wait`. Cancel errors are
+/// never retried or counted as book failures; they abort the batch.
+fn capture_cancelled(manager: &CaptureManager, error: &str) -> bool {
+    manager.cancel.load(Ordering::SeqCst)
+        || platform::escape_pressed()
+        || error == "手動で停止しました（保存済み画像は残ります）"
+        || error == "Escキーで停止しました（保存済み画像は残ります）"
+}
+
+/// Record one book as failed and let the batch move on. A cancel error is
+/// propagated instead: the user asked to stop, not to skip. The trace
+/// carries only the failure category, never the raw error text (the same
+/// policy as `trace_failure`).
+fn record_book_failure(
+    manager: &CaptureManager,
+    index: usize,
+    book: &BatchBook,
+    category: &'static str,
+    error: &str,
+) -> Result<(), String> {
+    if capture_cancelled(manager, error) {
+        return Err(error.to_string());
+    }
+    manager.trace(
+        "book_failed",
+        json!({"index":index + 1, "bookFingerprint":format!("{:x}", md5::compute(book.asin.as_bytes())), "reason":category}),
+    );
+    if let Ok(mut status) = manager.status.lock() {
+        status.failed_books += 1;
+        if status.failed_titles.len() < 10 {
+            status.failed_titles.push(book.title.clone());
+        }
+        status.message = format!("{}: 失敗したため次の本に進みます", book.title);
+    }
+    Ok(())
+}
+
+fn trace_attempt_failure(
+    manager: &CaptureManager,
+    index: usize,
+    book: &BatchBook,
+    attempt: u32,
+    error: &str,
+) {
+    manager.trace_failure("capture_book", error);
+    manager.trace(
+        "book_attempt_failed",
+        json!({"index":index + 1, "attempt":attempt, "bookFingerprint":format!("{:x}", md5::compute(book.asin.as_bytes()))}),
+    );
+}
+
+fn set_retry_message(manager: &CaptureManager, book: &BatchBook, attempt: u32) {
+    if let Ok(mut status) = manager.status.lock() {
+        status.message = format!(
+            "{}: 失敗したためもう一度試します（{attempt}/{}）",
+            book.title,
+            MAX_CAPTURE_ATTEMPTS - 1
+        );
+    }
+}
+
+/// Completion line for both batch wrappers, including failed-book info.
+fn batch_completion_message(status: &CaptureStatus) -> String {
+    let mut message = format!(
+        "一括バックアップ終了: 完了 {}冊・バックアップ済みスキップ {}冊",
+        status.completed_books, status.skipped_books
+    );
+    if status.failed_books > 0 {
+        message += &format!("・失敗スキップ {}冊", status.failed_books);
+        if !status.failed_titles.is_empty() {
+            let titles: Vec<&str> = status
+                .failed_titles
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect();
+            message += &format!("（失敗: {}）", titles.join("、"));
+        }
+    }
+    message
+}
+
+fn run_batch_inner(
+    manager: &CaptureManager,
+    books: &[BatchBook],
+    root: &Path,
+    format: capture_output::ArchiveFormat,
     mut capture_book: impl FnMut(&BatchBook, &Path) -> Result<CaptureEnd, String>,
+    retry_wait: Duration,
 ) -> Result<(), String> {
     for (index, book) in books.iter().enumerate() {
         wait(manager, Duration::ZERO)?;
@@ -610,46 +1074,110 @@ fn run_batch(
             status.total_positions = None;
             status.message = "バックアップ済みデータを確認しています".into();
         }
-        let destination = capture_output::archive_path(
+        let destination = match capture_output::archive_path(
             root,
             book.series_name.as_deref(),
             &book.title,
             &book.asin,
-        )?;
-        if capture_output::has_backup(&destination, &book.asin)? {
-            manager.trace("book_skipped", json!({"reason":"completed_archive_exists"}));
-            if let Ok(mut status) = manager.status.lock() {
-                status.skipped_books += 1;
-                status.output_directory = destination.to_string_lossy().into_owned();
+        ) {
+            Ok(destination) => destination,
+            Err(error) => {
+                record_book_failure(manager, index, book, "destination_path_failed", &error)?;
+                continue;
             }
+        };
+        match capture_output::has_backup(&destination, &book.asin) {
+            Ok(true) => {
+                manager.trace("book_skipped", json!({"reason":"completed_archive_exists"}));
+                if let Ok(mut status) = manager.status.lock() {
+                    status.skipped_books += 1;
+                    status.output_directory = destination.to_string_lossy().into_owned();
+                }
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                record_book_failure(manager, index, book, "backup_check_failed", &error)?;
+                continue;
+            }
+        }
+        // Capture with bounded retries. Each attempt gets a fresh work
+        // directory, so a failed attempt's partial pages never leak into
+        // the next attempt (they stay on disk for diagnosis).
+        let mut attempt = 0;
+        let captured: Result<PathBuf, (&'static str, String)> = loop {
+            attempt += 1;
+            wait(manager, Duration::ZERO)?;
+            let directory = match capture_output::work_directory(root, &book.asin) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    if capture_cancelled(manager, &error) {
+                        return Err(error);
+                    }
+                    trace_attempt_failure(manager, index, book, attempt, &error);
+                    if attempt >= MAX_CAPTURE_ATTEMPTS {
+                        break Err(("workdir_failed", error));
+                    }
+                    set_retry_message(manager, book, attempt);
+                    wait(manager, retry_wait)?;
+                    continue;
+                }
+            };
+            if let Ok(mut status) = manager.status.lock() {
+                status.saved_pages = 0;
+                status.unchanged_count = 0;
+                status.detected_region = None;
+                status.output_directory = directory.to_string_lossy().into_owned();
+                status.message = "内蔵リーダーで本を開いています".into();
+            }
+            match capture_book(book, &directory) {
+                Ok(CaptureEnd::LastPage) => break Ok(directory),
+                Ok(CaptureEnd::Limit) => {
+                    break Err(("page_limit", CaptureEnd::Limit.message().to_string()))
+                }
+                Ok(end) => {
+                    // Rewound: the reader ended somewhere unexpected.
+                    // Retryable like a capture error.
+                    let error = end.message().to_string();
+                    trace_attempt_failure(manager, index, book, attempt, &error);
+                    if attempt >= MAX_CAPTURE_ATTEMPTS {
+                        break Err(("rewound", error));
+                    }
+                    set_retry_message(manager, book, attempt);
+                    wait(manager, retry_wait)?;
+                }
+                Err(error) => {
+                    if capture_cancelled(manager, &error) {
+                        return Err(error);
+                    }
+                    if is_app_unavailable(&error) {
+                        // The Kindle app is gone (or never started): every
+                        // later book would fail the same way, so abort the
+                        // batch instead of retrying or skipping ahead.
+                        return Err(error);
+                    }
+                    trace_attempt_failure(manager, index, book, attempt, &error);
+                    if attempt >= MAX_CAPTURE_ATTEMPTS {
+                        break Err(("capture_failed", error));
+                    }
+                    set_retry_message(manager, book, attempt);
+                    wait(manager, retry_wait)?;
+                }
+            }
+        };
+        let directory = match captured {
+            Ok(directory) => directory,
+            Err((category, error)) => {
+                record_book_failure(manager, index, book, category, &error)?;
+                continue;
+            }
+        };
+        if let Err(error) =
+            publish_backup_with_format(manager, &directory, &destination, &book.asin, format)
+        {
+            record_book_failure(manager, index, book, "publish_failed", &error)?;
             continue;
         }
-        wait(manager, Duration::ZERO)?;
-        let directory = capture_output::work_directory(root, &book.asin)?;
-        if let Ok(mut status) = manager.status.lock() {
-            status.saved_pages = 0;
-            status.unchanged_count = 0;
-            status.detected_region = None;
-            status.output_directory = directory.to_string_lossy().into_owned();
-            status.message = "内蔵リーダーで本を開いています".into();
-        }
-        let end = capture_book(book, &directory).map_err(|error| {
-            manager.trace_failure("capture_book", &error);
-            format!("{}: {error}", book.title)
-        })?;
-        wait(manager, Duration::ZERO)?;
-        if end != CaptureEnd::LastPage {
-            manager.trace(
-                "book_stopped",
-                json!({"reason":if end == CaptureEnd::Limit {"page_limit"} else {"not_completed"}}),
-            );
-            return Err(format!(
-                "{}: {}。次の本には進みません",
-                book.title,
-                end.message()
-            ));
-        }
-        publish_backup(manager, &directory, &destination, &book.asin)?;
         manager.trace("book_finished", json!({"index":index + 1}));
         if let Ok(mut status) = manager.status.lock() {
             status.completed_books += 1;
@@ -664,14 +1192,40 @@ fn publish_backup(
     destination: &Path,
     asin: &str,
 ) -> Result<(), String> {
+    publish_backup_with_format(
+        manager,
+        directory,
+        destination,
+        asin,
+        capture_output::ArchiveFormat::PngV1,
+    )
+}
+
+fn publish_backup_with_format(
+    manager: &CaptureManager,
+    directory: &Path,
+    destination: &Path,
+    asin: &str,
+    format: capture_output::ArchiveFormat,
+) -> Result<(), String> {
     let pages = manager.status()?.saved_pages;
     if let Ok(mut status) = manager.status.lock() {
         status.message = "CBZバックアップを生成しています".into();
     }
-    manager.trace_step("publish_archive", || {
-        capture_output::finish_archive(directory, destination, asin, pages, || {
-            wait(manager, Duration::ZERO)
-        })
+    manager.trace_step("publish_archive", || match format {
+        capture_output::ArchiveFormat::PngV1 => {
+            capture_output::finish_archive(directory, destination, asin, pages, || {
+                wait(manager, Duration::ZERO)
+            })
+        }
+        format => capture_output::finish_archive_with_format(
+            directory,
+            destination,
+            asin,
+            pages,
+            format,
+            || wait(manager, Duration::ZERO),
+        ),
     })?;
     manager.trace("archive_completed", json!({"savedPages":pages}));
     if let Ok(mut status) = manager.status.lock() {
@@ -2801,24 +3355,59 @@ mod tests {
     }
 
     #[test]
-    fn batch_stops_on_limit_or_error_without_opening_next_book() {
-        for end in [Ok(CaptureEnd::Limit), Err("capture failed".into())] {
+    fn batch_skips_limit_or_error_and_opens_next_book() {
+        // A page limit ends the book without retries; a capture error is
+        // retried up to the cap. Either way the batch records the failure
+        // and continues with the next book, and the failed book's partial
+        // pages stay on disk.
+        for mode in ["limit", "error"] {
             let root = test_directory();
             let manager = CaptureManager::default();
-            let mut calls = 0;
-            let mut end = Some(end);
-            let result = run_batch(&manager, &batch_books(), &root, |_, directory| {
-                calls += 1;
-                fs::write(directory.join("screenshot_0001.png"), b"saved page").unwrap();
-                end.take().unwrap()
-            });
-            assert!(result.is_err());
-            assert_eq!(calls, 1);
-            assert_eq!(manager.status().unwrap().completed_books, 0);
+            let mut opened: Vec<String> = Vec::new();
+            let result = run_batch_inner(
+                &manager,
+                &batch_books(),
+                &root,
+                crate::capture_output::ArchiveFormat::PngV1,
+                |book, directory| {
+                    opened.push(book.asin.clone());
+                    fs::write(directory.join("screenshot_0001.png"), b"saved page").unwrap();
+                    if book.asin == "B000000001" {
+                        if mode == "limit" {
+                            return Ok(CaptureEnd::Limit);
+                        }
+                        return Err("capture failed".into());
+                    }
+                    manager.status.lock().unwrap().saved_pages = 1;
+                    Ok(CaptureEnd::LastPage)
+                },
+                Duration::ZERO,
+            );
+            assert!(result.is_ok());
+            let first_attempts = opened.iter().filter(|a| *a == "B000000001").count();
+            assert_eq!(
+                first_attempts,
+                if mode == "limit" {
+                    1
+                } else {
+                    MAX_CAPTURE_ATTEMPTS as usize
+                }
+            );
+            let status = manager.status().unwrap();
+            assert_eq!(status.completed_books, 2);
+            assert_eq!(status.failed_books, 1);
+            assert_eq!(status.failed_titles, vec!["B000000001".to_string()]);
             assert!(
                 has_capture_data(&root.join(".mmk-backup").join("B000000001"), || Ok(())).unwrap()
             );
-            assert!(!root.join("シリーズなし").join("B000000002").exists());
+            let second = crate::capture_output::archive_path(
+                &root,
+                None,
+                "B000000002",
+                "B000000002",
+            )
+            .unwrap();
+            assert!(crate::capture_output::has_backup(&second, "B000000002").unwrap());
             clean_test_directory(&root);
         }
     }
@@ -4125,5 +4714,160 @@ mod tests {
         }
         assert_eq!(rng.below(0), 0);
         assert_eq!(rng.below(1), 0);
+    }
+    #[test]
+    fn batch_retries_skips_after_limit_and_continues() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let manager = CaptureManager::default();
+        let root = test_directory();
+        let books = vec![
+            BatchBook {
+                asin: "B000000101".into(),
+                title: "Flaky".into(),
+                series_name: None,
+            },
+            BatchBook {
+                asin: "B000000102".into(),
+                title: "Broken".into(),
+                series_name: None,
+            },
+            BatchBook {
+                asin: "B000000103".into(),
+                title: "Good".into(),
+                series_name: None,
+            },
+        ];
+        let attempts: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+        let supervisor = manager.clone();
+        let result = run_batch_inner(
+            &manager,
+            &books,
+            &root,
+            crate::capture_output::ArchiveFormat::PngV1,
+            |book, directory| {
+                let attempt = {
+                    let mut map = attempts.borrow_mut();
+                    let entry = map.entry(book.asin.clone()).or_default();
+                    *entry += 1;
+                    *entry
+                };
+                if book.asin == "B000000102" {
+                    return Err("恒常的な失敗".into());
+                }
+                if book.asin == "B000000101" && attempt < 3 {
+                    return Err("一時的な失敗".into());
+                }
+                fs::write(directory.join("screenshot_0001.png"), b"page").unwrap();
+                supervisor.status.lock().unwrap().saved_pages = 1;
+                Ok(CaptureEnd::LastPage)
+            },
+            Duration::ZERO,
+        );
+        assert!(result.is_ok());
+        let status = manager.status().unwrap();
+        assert_eq!(status.completed_books, 2);
+        assert_eq!(status.failed_books, 1);
+        assert_eq!(status.failed_titles, vec!["Broken".to_string()]);
+        let map = attempts.borrow();
+        assert_eq!(map["B000000101"], 3);
+        assert_eq!(map["B000000102"], 3);
+        assert_eq!(map["B000000103"], 1);
+        let destination =
+            crate::capture_output::archive_path(&root, None, "Flaky", "B000000101").unwrap();
+        assert!(crate::capture_output::has_backup(&destination, "B000000101").unwrap());
+        fs::remove_dir_all(&root).ok();
+    }
+    #[test]
+    fn batch_aborts_when_kindle_app_unavailable() {
+        use std::cell::RefCell;
+        for message in [APP_NOT_RUNNING_MESSAGE, APP_START_FAILED_MESSAGE] {
+            let manager = CaptureManager::default();
+            let root = test_directory();
+            let books = vec![
+                BatchBook {
+                    asin: "B000000101".into(),
+                    title: "Good".into(),
+                    series_name: None,
+                },
+                BatchBook {
+                    asin: "B000000102".into(),
+                    title: "NoApp".into(),
+                    series_name: None,
+                },
+                BatchBook {
+                    asin: "B000000103".into(),
+                    title: "Never".into(),
+                    series_name: None,
+                },
+            ];
+            let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            let supervisor = manager.clone();
+            let result = run_batch_inner(
+                &manager,
+                &books,
+                &root,
+                crate::capture_output::ArchiveFormat::PngV1,
+                |book, directory| {
+                    calls.borrow_mut().push(book.asin.clone());
+                    if book.asin == "B000000102" {
+                        return Err(message.into());
+                    }
+                    fs::write(directory.join("screenshot_0001.png"), b"page").unwrap();
+                    supervisor.status.lock().unwrap().saved_pages = 1;
+                    Ok(CaptureEnd::LastPage)
+                },
+                Duration::ZERO,
+            );
+            assert_eq!(result.unwrap_err(), message);
+            // Not retried, and the next book never starts.
+            assert_eq!(calls.borrow().as_slice(), ["B000000101", "B000000102"]);
+            let status = manager.status().unwrap();
+            assert_eq!(status.completed_books, 1);
+            assert_eq!(status.failed_books, 0);
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+    #[test]
+    fn app_unavailable_message_maps_tool_tokens() {
+        assert_eq!(
+            app_unavailable_message("APP_NOT_RUNNING: Kindle app window not found"),
+            Some(APP_NOT_RUNNING_MESSAGE)
+        );
+        assert_eq!(
+            app_unavailable_message("APP_START_FAILED: Kindle app window not found"),
+            Some(APP_START_FAILED_MESSAGE)
+        );
+        assert_eq!(
+            app_unavailable_message("could not enter fullscreen/maximized"),
+            None
+        );
+        assert_eq!(app_unavailable_message(""), None);
+    }
+    #[test]
+    fn batch_cancel_error_aborts_without_counting_failure() {
+        let manager = CaptureManager::default();
+        let root = test_directory();
+        let books = vec![BatchBook {
+            asin: "B000000101".into(),
+            title: "Flaky".into(),
+            series_name: None,
+        }];
+        let mut attempts = 0;
+        let result = run_batch_inner(
+            &manager,
+            &books,
+            &root,
+            crate::capture_output::ArchiveFormat::PngV1,
+            |_, _| {
+                attempts += 1;
+                Err("手動で停止しました（保存済み画像は残ります）".into())
+            },
+            Duration::ZERO,
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(manager.status().unwrap().failed_books, 0);
+        fs::remove_dir_all(&root).ok();
     }
 }

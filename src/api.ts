@@ -39,6 +39,7 @@ export const api = {
   getBackupSettings: backupSettings.load,
   saveBackupSettings: backupSettings.save,
   pageCaptureStatus: () => invoke<CaptureStatus>("page_capture_status"),
+  openProgressWindow: () => invoke<void>("open_progress_window"),
   stopPageCapture: () => invoke<void>("stop_page_capture"),
   openCaptureDirectory: () => invoke<void>("open_capture_directory"),
   previewCaptureLayout: (setup: { handle: string; processId: number; portrait: boolean }) => invoke<CapturePreview>("preview_capture_layout", { setup }),
