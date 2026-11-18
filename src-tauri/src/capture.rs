@@ -94,6 +94,9 @@ pub struct BatchBook {
     pub asin: String,
     pub title: String,
     pub series_name: Option<String>,
+    /// Classified as a text book by an earlier desktop batch. Such books
+    /// are skipped without being opened (desktop engine only).
+    pub known_text_book: bool,
 }
 
 impl BatchCaptureOptions {
@@ -177,6 +180,8 @@ pub struct CaptureStatus {
     pub skipped_books: usize,
     pub failed_books: usize,
     pub failed_titles: Vec<String>,
+    pub text_books: usize,
+    pub text_titles: Vec<String>,
     pub current_title: String,
     pub current_position: Option<u32>,
     pub total_positions: Option<u32>,
@@ -188,12 +193,17 @@ pub struct CaptureStatus {
     pub progress_updated_at: Option<i64>,
 }
 
+/// Persists a newly detected text book (by ASIN). Set by the desktop
+/// batch, which is the only flow that can detect one.
+type TextBookSink = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct CaptureManager {
     status: Arc<Mutex<CaptureStatus>>,
     cancel: Arc<AtomicBool>,
     log: Arc<Mutex<capture_log::CaptureLog>>,
     progress_stamp: Arc<Mutex<Option<(String, std::time::SystemTime)>>>,
+    text_book_sink: Arc<Mutex<Option<TextBookSink>>>,
 }
 
 impl CaptureManager {
@@ -210,11 +220,12 @@ impl CaptureManager {
         // 進捗キーの変化を観測して最終変化時刻を付ける。ポーリング間隔の
         // 範囲でしか観測できないが、進捗ウィンドウ表示中は毎秒呼ばれる。
         let progress_key = format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             status.running,
             status.completed_books,
             status.skipped_books,
             status.failed_books,
+            status.text_books,
             status.saved_pages,
             status.current_title,
             status.current_position.map(|p| p.to_string()).unwrap_or_default(),
@@ -414,6 +425,9 @@ impl CaptureManager {
             ..Default::default()
         };
         self.begin_trace(json!({"mode":"batch", "books":books.len(), "pageLayout":if options.portrait {"single"} else {"spread"}, "key":options.key, "waitTimeoutMs":options.wait_timeout_ms, "maxPages":options.max_pages}));
+        if let Ok(mut sink) = self.text_book_sink.lock() {
+            *sink = None;
+        }
         let manager = self.clone();
         let spawned = std::thread::Builder::new()
             .name("kindle-batch-capture".into())
@@ -494,6 +508,7 @@ impl CaptureManager {
         root: PathBuf,
         tool_path: PathBuf,
         max_pages: u32,
+        on_text_book: TextBookSink,
     ) -> Result<(), String> {
         if books.is_empty() || books.len() > 10_000 {
             return Err("バックアップ対象は1〜10000冊で指定してください".into());
@@ -516,6 +531,9 @@ impl CaptureManager {
             ..Default::default()
         };
         self.begin_trace(json!({"mode": "batch-desktop", "books": books.len(), "maxPages": max_pages}));
+        if let Ok(mut sink) = self.text_book_sink.lock() {
+            *sink = Some(on_text_book);
+        }
         // Only the first tool run of the batch may launch the Kindle app;
         // later runs must find it already running (see capture_book_desktop).
         let launch = std::sync::Arc::new(AtomicBool::new(true));
@@ -568,6 +586,9 @@ impl CaptureManager {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
+                }
+                if let Ok(mut sink) = manager.text_book_sink.lock() {
+                    *sink = None;
                 }
                 if let Ok(mut status) = manager.status.lock() {
                     status.running = false;
@@ -795,6 +816,27 @@ fn is_app_unavailable(error: &str) -> bool {
     error == APP_NOT_RUNNING_MESSAGE || error == APP_START_FAILED_MESSAGE
 }
 
+/// Tool status-error token for "this book is a reflowable text book".
+/// The desktop tool reports it when the reader opens but no location
+/// ever appears; mmk classifies the book as out of scope (no retries)
+/// and remembers it so later batches skip it without opening it.
+const TEXT_BOOK_TOKEN: &str = "TEXT_BOOK:";
+const TEXT_BOOK_MESSAGE: &str = "テキスト形式の本のため、撮影対象外です";
+
+/// Map a desktop tool failure detail to the text-book message when the
+/// failure is "the reader opened but has no locations".
+fn text_book_message(detail: &str) -> Option<&'static str> {
+    if detail.starts_with(TEXT_BOOK_TOKEN) {
+        Some(TEXT_BOOK_MESSAGE)
+    } else {
+        None
+    }
+}
+
+fn is_text_book(error: &str) -> bool {
+    error == TEXT_BOOK_MESSAGE
+}
+
 fn capture_book_desktop(
     manager: &CaptureManager,
     book: &BatchBook,
@@ -902,6 +944,9 @@ fn capture_book_desktop(
         if let Some(message) = app_unavailable_message(&detail) {
             return Err(message.into());
         }
+        if let Some(message) = text_book_message(&detail) {
+            return Err(message.into());
+        }
         return Err(format!(
             "デスクトップ撮影に失敗しました: {detail}（ログ: {}）",
             log_path.display()
@@ -938,6 +983,14 @@ const MAX_CAPTURE_ATTEMPTS: u32 = 3;
 /// Pause between capture attempts of the same book (cancel-aware).
 const CAPTURE_RETRY_WAIT: Duration = Duration::from_secs(60);
 
+/// Pause before starting the next book after one ends in failure or a
+/// text-book skip. The desktop app needs a moment to finish tearing
+/// down the reader/library transition; starting the next book
+/// immediately has been observed to leave it unresponsive to cover
+/// clicks. Successes and books skipped because a backup already
+/// exists do not pay this.
+const BATCH_SETTLE_WAIT: Duration = Duration::from_secs(10);
+
 fn run_batch(
     manager: &CaptureManager,
     books: &[BatchBook],
@@ -967,6 +1020,7 @@ fn run_batch_with_format(
         format,
         capture_book,
         CAPTURE_RETRY_WAIT,
+        BATCH_SETTLE_WAIT,
     )
 }
 
@@ -1009,6 +1063,46 @@ fn record_book_failure(
     Ok(())
 }
 
+/// Record a book as out of scope because it is a reflowable text book.
+/// `reason` is "known" (classified by an earlier batch, not opened) or
+/// "detected" (the desktop tool just classified it). New detections are
+/// persisted immediately through the sink so later batches skip the
+/// book without opening it; a persistence failure is traced and does
+/// not stop the batch (a later batch simply detects it again).
+fn record_book_text_skip(
+    manager: &CaptureManager,
+    index: usize,
+    book: &BatchBook,
+    reason: &'static str,
+) {
+    manager.trace(
+        "book_text_book",
+        json!({"index":index + 1, "bookFingerprint":format!("{:x}", md5::compute(book.asin.as_bytes())), "reason":reason}),
+    );
+    if let Ok(mut status) = manager.status.lock() {
+        status.text_books += 1;
+        if status.text_titles.len() < 10 {
+            status.text_titles.push(book.title.clone());
+        }
+        status.message = format!("{}: テキスト形式のため対象外です", book.title);
+    }
+    if reason == "detected" {
+        let sink = manager
+            .text_book_sink
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(sink) = sink {
+            if sink(&book.asin).is_err() {
+                manager.trace(
+                    "book_text_book_persist_failed",
+                    json!({"index":index + 1, "bookFingerprint":format!("{:x}", md5::compute(book.asin.as_bytes()))}),
+                );
+            }
+        }
+    }
+}
+
 fn trace_attempt_failure(
     manager: &CaptureManager,
     index: usize,
@@ -1039,6 +1133,18 @@ fn batch_completion_message(status: &CaptureStatus) -> String {
         "一括バックアップ終了: 完了 {}冊・バックアップ済みスキップ {}冊",
         status.completed_books, status.skipped_books
     );
+    if status.text_books > 0 {
+        message += &format!("・対象外スキップ {}冊", status.text_books);
+        if !status.text_titles.is_empty() {
+            let titles: Vec<&str> = status
+                .text_titles
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect();
+            message += &format!("（テキスト形式: {}）", titles.join("、"));
+        }
+    }
     if status.failed_books > 0 {
         message += &format!("・失敗スキップ {}冊", status.failed_books);
         if !status.failed_titles.is_empty() {
@@ -1061,8 +1167,17 @@ fn run_batch_inner(
     format: capture_output::ArchiveFormat,
     mut capture_book: impl FnMut(&BatchBook, &Path) -> Result<CaptureEnd, String>,
     retry_wait: Duration,
+    settle_wait: Duration,
 ) -> Result<(), String> {
+    let mut settle_before_next = false;
     for (index, book) in books.iter().enumerate() {
+        if settle_before_next {
+            // The previous book failed or was classified as a text
+            // book; give the desktop app a moment to settle before
+            // driving it again (see BATCH_SETTLE_WAIT).
+            wait(manager, settle_wait)?;
+            settle_before_next = false;
+        }
         wait(manager, Duration::ZERO)?;
         manager.trace("book_started", json!({"index":index + 1, "bookFingerprint":format!("{:x}", md5::compute(book.asin.as_bytes()))}));
         if let Ok(mut status) = manager.status.lock() {
@@ -1074,6 +1189,13 @@ fn run_batch_inner(
             status.total_positions = None;
             status.message = "バックアップ済みデータを確認しています".into();
         }
+        if book.known_text_book {
+            // Classified as a text book by an earlier batch: never open
+            // it again.
+            record_book_text_skip(manager, index, book, "known");
+            settle_before_next = true;
+            continue;
+        }
         let destination = match capture_output::archive_path(
             root,
             book.series_name.as_deref(),
@@ -1083,6 +1205,7 @@ fn run_batch_inner(
             Ok(destination) => destination,
             Err(error) => {
                 record_book_failure(manager, index, book, "destination_path_failed", &error)?;
+                settle_before_next = true;
                 continue;
             }
         };
@@ -1098,6 +1221,7 @@ fn run_batch_inner(
             Ok(false) => {}
             Err(error) => {
                 record_book_failure(manager, index, book, "backup_check_failed", &error)?;
+                settle_before_next = true;
                 continue;
             }
         }
@@ -1156,6 +1280,11 @@ fn run_batch_inner(
                         // batch instead of retrying or skipping ahead.
                         return Err(error);
                     }
+                    if is_text_book(&error) {
+                        // A text book will never become capturable by
+                        // retrying: classify it and move on.
+                        break Err(("text_book", error));
+                    }
                     trace_attempt_failure(manager, index, book, attempt, &error);
                     if attempt >= MAX_CAPTURE_ATTEMPTS {
                         break Err(("capture_failed", error));
@@ -1167,8 +1296,14 @@ fn run_batch_inner(
         };
         let directory = match captured {
             Ok(directory) => directory,
+            Err(("text_book", _)) => {
+                record_book_text_skip(manager, index, book, "detected");
+                settle_before_next = true;
+                continue;
+            }
             Err((category, error)) => {
                 record_book_failure(manager, index, book, category, &error)?;
+                settle_before_next = true;
                 continue;
             }
         };
@@ -1176,6 +1311,7 @@ fn run_batch_inner(
             publish_backup_with_format(manager, &directory, &destination, &book.asin, format)
         {
             record_book_failure(manager, index, book, "publish_failed", &error)?;
+            settle_before_next = true;
             continue;
         }
         manager.trace("book_finished", json!({"index":index + 1}));
@@ -3244,6 +3380,7 @@ mod tests {
                 asin: asin.into(),
                 title: asin.into(),
                 series_name: None,
+                known_text_book: false,
             })
             .collect()
     }
@@ -3382,6 +3519,7 @@ mod tests {
                     Ok(CaptureEnd::LastPage)
                 },
                 Duration::ZERO,
+                Duration::ZERO,
             );
             assert!(result.is_ok());
             let first_attempts = opened.iter().filter(|a| *a == "B000000001").count();
@@ -3410,6 +3548,43 @@ mod tests {
             assert!(crate::capture_output::has_backup(&second, "B000000002").unwrap());
             clean_test_directory(&root);
         }
+    }
+
+    #[test]
+    fn batch_settles_after_a_failed_book_before_opening_the_next() {
+        // After a book fails, the batch waits the settle duration before
+        // the next book is opened; a successful book adds no wait, so a
+        // two-book batch with one failure pays the settle exactly once.
+        let root = test_directory();
+        let manager = CaptureManager::default();
+        let settle = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let result = run_batch_inner(
+            &manager,
+            &batch_books(),
+            &root,
+            crate::capture_output::ArchiveFormat::PngV1,
+            |book, directory| {
+                fs::write(directory.join("screenshot_0001.png"), b"saved page").unwrap();
+                if book.asin == "B000000001" {
+                    return Err("capture failed".into());
+                }
+                manager.status.lock().unwrap().saved_pages = 1;
+                Ok(CaptureEnd::LastPage)
+            },
+            Duration::ZERO,
+            settle,
+        );
+        assert!(result.is_ok());
+        assert!(
+            started.elapsed() >= settle,
+            "elapsed {:?} should include one settle wait",
+            started.elapsed()
+        );
+        let status = manager.status().unwrap();
+        assert_eq!(status.failed_books, 1);
+        assert_eq!(status.completed_books, 2);
+        clean_test_directory(&root);
     }
 
     #[test]
@@ -4726,16 +4901,19 @@ mod tests {
                 asin: "B000000101".into(),
                 title: "Flaky".into(),
                 series_name: None,
+                known_text_book: false,
             },
             BatchBook {
                 asin: "B000000102".into(),
                 title: "Broken".into(),
                 series_name: None,
+                known_text_book: false,
             },
             BatchBook {
                 asin: "B000000103".into(),
                 title: "Good".into(),
                 series_name: None,
+                known_text_book: false,
             },
         ];
         let attempts: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
@@ -4763,6 +4941,7 @@ mod tests {
                 Ok(CaptureEnd::LastPage)
             },
             Duration::ZERO,
+            Duration::ZERO,
         );
         assert!(result.is_ok());
         let status = manager.status().unwrap();
@@ -4789,16 +4968,19 @@ mod tests {
                     asin: "B000000101".into(),
                     title: "Good".into(),
                     series_name: None,
+                    known_text_book: false,
                 },
                 BatchBook {
                     asin: "B000000102".into(),
                     title: "NoApp".into(),
                     series_name: None,
+                    known_text_book: false,
                 },
                 BatchBook {
                     asin: "B000000103".into(),
                     title: "Never".into(),
                     series_name: None,
+                    known_text_book: false,
                 },
             ];
             let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
@@ -4817,6 +4999,7 @@ mod tests {
                     supervisor.status.lock().unwrap().saved_pages = 1;
                     Ok(CaptureEnd::LastPage)
                 },
+                Duration::ZERO,
                 Duration::ZERO,
             );
             assert_eq!(result.unwrap_err(), message);
@@ -4845,6 +5028,157 @@ mod tests {
         assert_eq!(app_unavailable_message(""), None);
     }
     #[test]
+    fn text_book_message_maps_tool_tokens() {
+        assert_eq!(
+            text_book_message("TEXT_BOOK: reader location stays empty after opening"),
+            Some(TEXT_BOOK_MESSAGE)
+        );
+        // The exact prefix (with colon) is required.
+        assert_eq!(text_book_message("TEXT_BOOKKEEPER: unrelated"), None);
+        assert_eq!(
+            text_book_message("could not read reader location after opening"),
+            None
+        );
+        assert_eq!(text_book_message(""), None);
+    }
+    #[test]
+    fn batch_skips_detected_text_book_without_retry() {
+        use std::cell::RefCell;
+        let manager = CaptureManager::default();
+        let persisted: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persisted_clone = persisted.clone();
+        *manager.text_book_sink.lock().unwrap() = Some(Arc::new(move |asin: &str| {
+            persisted_clone.lock().unwrap().push(asin.to_string());
+            Ok(())
+        }));
+        let root = test_directory();
+        let books = vec![
+            BatchBook {
+                asin: "B000000101".into(),
+                title: "Novel".into(),
+                series_name: None,
+                known_text_book: false,
+            },
+            BatchBook {
+                asin: "B000000102".into(),
+                title: "Manga".into(),
+                series_name: None,
+                known_text_book: false,
+            },
+        ];
+        let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let supervisor = manager.clone();
+        let result = run_batch_inner(
+            &manager,
+            &books,
+            &root,
+            crate::capture_output::ArchiveFormat::PngV1,
+            |book, directory| {
+                calls.borrow_mut().push(book.asin.clone());
+                if book.asin == "B000000101" {
+                    return Err(TEXT_BOOK_MESSAGE.into());
+                }
+                fs::write(directory.join("screenshot_0001.png"), b"page").unwrap();
+                supervisor.status.lock().unwrap().saved_pages = 1;
+                Ok(CaptureEnd::LastPage)
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok());
+        // The text book is tried exactly once; the manga still completes.
+        assert_eq!(calls.borrow().as_slice(), ["B000000101", "B000000102"]);
+        let status = manager.status().unwrap();
+        assert_eq!(status.text_books, 1);
+        assert_eq!(status.text_titles, vec!["Novel".to_string()]);
+        assert_eq!(status.failed_books, 0);
+        assert_eq!(status.completed_books, 1);
+        // The detection was persisted immediately.
+        assert_eq!(persisted.lock().unwrap().as_slice(), ["B000000101"]);
+        fs::remove_dir_all(&root).ok();
+    }
+    #[test]
+    fn batch_text_book_skip_tolerates_persistence_failure() {
+        let manager = CaptureManager::default();
+        *manager.text_book_sink.lock().unwrap() =
+            Some(Arc::new(|_| Err("db down".into())));
+        let root = test_directory();
+        let books = vec![BatchBook {
+            asin: "B000000101".into(),
+            title: "Novel".into(),
+            series_name: None,
+            known_text_book: false,
+        }];
+        let result = run_batch_inner(
+            &manager,
+            &books,
+            &root,
+            crate::capture_output::ArchiveFormat::PngV1,
+            |_, _| Err(TEXT_BOOK_MESSAGE.into()),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok());
+        let status = manager.status().unwrap();
+        assert_eq!(status.text_books, 1);
+        assert_eq!(status.failed_books, 0);
+        fs::remove_dir_all(&root).ok();
+    }
+    #[test]
+    fn batch_skips_known_text_book_without_capture() {
+        use std::cell::Cell;
+        let manager = CaptureManager::default();
+        let root = test_directory();
+        let books = vec![
+            BatchBook {
+                asin: "B000000101".into(),
+                title: "Novel".into(),
+                series_name: None,
+                known_text_book: true,
+            },
+            BatchBook {
+                asin: "B000000102".into(),
+                title: "Manga".into(),
+                series_name: None,
+                known_text_book: false,
+            },
+        ];
+        let calls = Cell::new(0u32);
+        let supervisor = manager.clone();
+        let result = run_batch_inner(
+            &manager,
+            &books,
+            &root,
+            crate::capture_output::ArchiveFormat::PngV1,
+            |book, directory| {
+                calls.set(calls.get() + 1);
+                assert_eq!(book.asin, "B000000102");
+                fs::write(directory.join("screenshot_0001.png"), b"page").unwrap();
+                supervisor.status.lock().unwrap().saved_pages = 1;
+                Ok(CaptureEnd::LastPage)
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 1);
+        let status = manager.status().unwrap();
+        assert_eq!(status.text_books, 1);
+        assert_eq!(status.completed_books, 1);
+        fs::remove_dir_all(&root).ok();
+    }
+    #[test]
+    fn completion_message_mentions_text_books() {
+        let mut status = CaptureStatus::default();
+        status.completed_books = 3;
+        status.text_books = 2;
+        status.text_titles = vec!["A".into(), "B".into(), "C".into(), "D".into()];
+        let message = batch_completion_message(&status);
+        assert!(message.contains("対象外スキップ 2冊"), "{message}");
+        assert!(message.contains("（テキスト形式: A、B、C）"), "{message}");
+    }
+    #[test]
     fn batch_cancel_error_aborts_without_counting_failure() {
         let manager = CaptureManager::default();
         let root = test_directory();
@@ -4852,6 +5186,7 @@ mod tests {
             asin: "B000000101".into(),
             title: "Flaky".into(),
             series_name: None,
+            known_text_book: false,
         }];
         let mut attempts = 0;
         let result = run_batch_inner(
@@ -4863,6 +5198,7 @@ mod tests {
                 attempts += 1;
                 Err("手動で停止しました（保存済み画像は残ります）".into())
             },
+            Duration::ZERO,
             Duration::ZERO,
         );
         assert!(result.is_err());

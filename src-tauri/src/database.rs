@@ -70,6 +70,14 @@ impl Database {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        if !table_has_column(&connection, "user_book_metadata", "is_text_book")? {
+            connection
+                .execute(
+                    "ALTER TABLE user_book_metadata ADD COLUMN is_text_book INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         Ok(database)
     }
 
@@ -193,6 +201,7 @@ impl Database {
                     manual_authors,
                     manual_publisher: row.get(23)?,
                     label: row.get(24)?,
+                    is_text_book: row.get::<_, i64>(25)? != 0,
                     tags: tags
                         .map(|value| value.split('\u{1f}').map(str::to_owned).collect())
                         .unwrap_or_default(),
@@ -201,6 +210,21 @@ impl Database {
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<_, _>>()
             .map_err(|error| error.to_string())
+    }
+
+    /// Remember that a book is a reflowable text book (the desktop
+    /// capture tool cannot paginate it). Stored in user_book_metadata
+    /// so the classification survives library syncs.
+    pub fn mark_text_book(&self, asin: &str) -> Result<(), String> {
+        let connection = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO user_book_metadata (book_id, is_text_book, updated_at) SELECT id, 1, ?2 FROM books WHERE asin = ?1 ON CONFLICT(book_id) DO UPDATE SET is_text_book = 1, updated_at = excluded.updated_at",
+                params![asin, now],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn save_metadata(&self, input: BookMetadataInput) -> Result<(), String> {
@@ -735,7 +759,7 @@ SELECT b.id, b.asin, COALESCE(NULLIF(u.manual_title,''), b.source_title), b.sour
  CASE COALESCE(u.series_mode,'auto') WHEN 'manual' THEN u.manual_series_index WHEN 'none' THEN NULL ELSE b.inferred_series_index END,
  u.manual_authors, u.manual_title,
  (SELECT group_concat(t.name, char(31)) FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id=b.id),
- u.manual_publisher, b.label
+ u.manual_publisher, b.label, COALESCE(u.is_text_book,0)
 FROM books b LEFT JOIN user_book_metadata u ON u.book_id=b.id
 ORDER BY COALESCE(NULLIF(u.manual_title,''), b.source_title) COLLATE NOCASE, b.asin
 "#;
@@ -822,6 +846,24 @@ mod tests {
         assert!(book.favorite);
         assert_eq!(book.effective_series_name.as_deref(), Some("手動シリーズ"));
         assert_eq!(book.tags, vec!["再読", "資料"]);
+        drop(database);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mark_text_book_survives_sync() {
+        let (database, path) = test_database();
+        database
+            .sync(Path::new("metadata.xml"), &[imported("小説")], 0)
+            .unwrap();
+        assert!(!database.list_books().unwrap()[0].is_text_book);
+        database.mark_text_book("B012345678").unwrap();
+        assert!(database.list_books().unwrap()[0].is_text_book);
+        // A re-sync must not clear the classification.
+        database
+            .sync(Path::new("metadata.xml"), &[imported("小説")], 0)
+            .unwrap();
+        assert!(database.list_books().unwrap()[0].is_text_book);
         drop(database);
         let _ = fs::remove_file(path);
     }

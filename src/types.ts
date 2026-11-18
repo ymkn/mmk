@@ -46,6 +46,8 @@ export interface CaptureStatus {
   skippedBooks: number;
   failedBooks: number;
   failedTitles: string[];
+  textBooks: number;
+  textTitles: string[];
   currentTitle: string;
   currentPosition: number | null;
   totalPositions: number | null;
@@ -91,6 +93,7 @@ export interface Book {
   manualPublisher: string | null;
   label: string | null;
   tags: string[];
+  isTextBook: boolean;
 }
 
 export interface SyncResult {

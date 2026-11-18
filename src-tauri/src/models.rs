@@ -45,6 +45,9 @@ pub struct BookView {
     pub manual_publisher: Option<String>,
     pub label: Option<String>,
     pub tags: Vec<String>,
+    /// Classified as a reflowable text book (not capturable by the
+    /// desktop engine). Remembered across syncs in user_book_metadata.
+    pub is_text_book: bool,
 }
 
 #[derive(Debug, Deserialize)]

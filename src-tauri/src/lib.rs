@@ -744,7 +744,9 @@ async fn list_pending_backups(
         let mut pending = Vec::new();
         for book in books
             .into_iter()
-            .filter(|b| b.source_status == "active" && selected.contains(&b.id))
+            .filter(|b| {
+                b.source_status == "active" && !b.is_text_book && selected.contains(&b.id)
+            })
         {
             let path = capture_output::archive_path(
                 &root,
@@ -803,6 +805,7 @@ fn start_batch_capture(
             asin: book.asin,
             title: book.title,
             series_name: book.effective_series_name,
+            known_text_book: book.is_text_book,
         });
     }
     if settings.engine == backup_settings::BackupEngine::Desktop {
@@ -829,14 +832,28 @@ fn start_batch_capture(
         if report.get("allowLaunch").and_then(|v| v.as_bool()) != Some(true) {
             return Err("デスクトップ撮影ツールが旧版です（バッチ中のアプリ再起動を抑止できる版が必要です）".into());
         }
+        if report.get("textBook").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("デスクトップ撮影ツールが旧版です（テキスト形式の本を判定できる版が必要です）".into());
+        }
+        if report.get("windowLossFailFast").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("デスクトップ撮影ツールが旧版です（ウィンドウ消失を即時に検知できる版が必要です）".into());
+        }
         let root = backup_root(&app, &options.output_directory)?;
-        return manager.start_batch_desktop(books, root, tool, settings.max_pages);
+        let database_for_callback = database.inner().clone();
+        let on_text_book: std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync> =
+            std::sync::Arc::new(move |asin: &str| database_for_callback.mark_text_book(asin));
+        return manager.start_batch_desktop(books, root, tool, settings.max_pages, on_text_book);
     }
     let directory = app
         .path()
         .picture_dir()
         .map_err(|e| e.to_string())?
         .join("MMK");
+    // Text-book classifications come from the desktop tool; the web
+    // reader flow does not skip books for them.
+    for book in &mut books {
+        book.known_text_book = false;
+    }
     manager.start_batch(options, books, directory, app)
 }
 

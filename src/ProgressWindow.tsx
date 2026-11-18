@@ -55,7 +55,7 @@ export function ProgressWindow() {
   const lastProgressAt = status?.progressUpdatedAt ?? null;
   const stalled = running && lastProgressAt !== null && now - lastProgressAt >= STALL_THRESHOLD_MS;
   const batchDone = !running && status !== null && status.batch && status.totalBooks > 0
-    && status.completedBooks + status.skippedBooks + status.failedBooks >= status.totalBooks;
+    && status.completedBooks + status.skippedBooks + status.failedBooks + status.textBooks >= status.totalBooks;
 
   let tone: Tone;
   let label: string;
@@ -80,7 +80,7 @@ export function ProgressWindow() {
         : status?.message && <p className="progress-title">{status.message}</p>}
       {status?.batch && status.totalBooks > 0 && (
         <p className="progress-counts">
-          完了 {status.completedBooks}冊・スキップ {status.skippedBooks}冊・失敗 {status.failedBooks}冊／全{status.totalBooks}冊
+          完了 {status.completedBooks}冊・スキップ {status.skippedBooks}冊・失敗 {status.failedBooks}冊{status.textBooks > 0 && <>・対象外 {status.textBooks}冊</>}／全{status.totalBooks}冊
         </p>
       )}
       {status && (
