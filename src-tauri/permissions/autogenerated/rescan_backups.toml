@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rescan-backups"
+description = "Enables the rescan_backups command without any pre-configured scope."
+commands.allow = ["rescan_backups"]
+
+[[permission]]
+identifier = "deny-rescan-backups"
+description = "Denies the rescan_backups command without any pre-configured scope."
+commands.deny = ["rescan_backups"]

@@ -34,6 +34,7 @@ fn main() {
             "get_backup_settings",
             "save_backup_settings",
             "list_pending_backups",
+            "rescan_backups",
         ]));
     tauri_build::try_build(attributes).expect("failed to build Tauri application metadata");
 }
